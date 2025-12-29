@@ -1,6 +1,7 @@
 CFLAGS += $(addprefix -I,$(PLAT_INC_DIR))
 CFLAGS += $(addprefix -I,$(MPI_INC_DIR))
 CFLAGS += $(addprefix -I,$(APP_INC_DIR))
+export CFLAGS
 
 dir_y :=
 dir_y += updater
