@@ -8,16 +8,16 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <linux/videodev2.h>
-
+#include <sys/stat.h>
 #include "isp_basic.h"
 #include "isp_vi.h"
 #include "list.h"
 #include "akuio.h"
-
+#include <sys/mman.h>
 #include "ak_thread.h"
 
 #define CLEAR(x) memset(&(x), 0, sizeof(x))
-#define BUFF_NUM 				3
+#define BUFF_NUM 3
 #define DEFAULT_DROP_FRAME_NUM 	3
 #define ENOUGH_MEM(min_type, max_type) assert(sizeof(min_type)<=sizeof(max_type))
 #define IMAGE_BUFFER_SIZE		4096
@@ -28,12 +28,15 @@
 #define ISP_CHECK_FRAME_TS		(0)
 #define CALC_GET_V4L2_TIME		(0)
 
-/* frame status */
+static int set_v4l2_reqbufs(int fd);
+static int set_v4l2_qbuf(int fd);
+static int xioctl(int fd, int request, void *arg);
 enum frame_status {
-	FRAME_STATE_RESERVED,	//reserved flag
-	FRAME_STATE_USING,		//usging flag, cann't release
-	FRAME_STATE_USE_OK		//when use ok, can release
+    FRAME_STATE_RESERVED,
+    FRAME_STATE_USING,
+    FRAME_STATE_USE_OK
 };
+static void *mmap_addr = NULL;
 
 /* frame buffer information */
 struct buffer {
@@ -52,8 +55,9 @@ enum AK_ISP_RES_TYPE {
 	MAIN_CHN_RES,	//main channel resolution type
 	SUB_CHN_RES		//sub channel resolution type
 };
+int release_data_buf(int video0_fd, struct v4l2_buffer *buf);
 
-static struct v4l2_buffer v4l2_buf;
+
 static struct buffer *buffers = NULL;
 
 LIST_HEAD(v4l2_frame_list);	//frame list head
@@ -66,9 +70,9 @@ static unsigned long frame_ptr_seq_no = 0;
 static unsigned int drop_isp_frame = (BUFF_NUM - 1);
 /* isp operate lock and frame list operate lock */
 static pthread_mutex_t isp_manipulate_mutex_lock = PTHREAD_MUTEX_INITIALIZER;
-static pthread_mutex_t isp_frame_list_lock = PTHREAD_MUTEX_INITIALIZER;
+//static pthread_mutex_t isp_frame_list_lock = PTHREAD_MUTEX_INITIALIZER;
 /* buffer memory address */
-static void *ion_mem = NULL;
+
 /* video device name */
 static char *dev_name = "/dev/video0";
 /* drop some of first frame */
@@ -88,47 +92,6 @@ static int xioctl(int fd, int request, void *arg)
 	return ret;
 }
 
-static int malloc_capture_buffers(int align_buf_size)
-{
-	/* allocate buffers memory */
-	buffers = calloc(BUFF_NUM, sizeof(struct buffer));
-	if (!buffers) {
-		ak_print_normal_ex("Out of memory\n");
-		return AK_FAILED;
-	}
-
-	/* init frame buf's dma buf */
-	int ion_size = align_buf_size * BUFF_NUM;
-	ion_mem = akuio_alloc_pmem(ion_size);
-	if (!ion_mem) {
-		ak_print_normal_ex("Allocate %d bytes failed\n", ion_size);
-		free(buffers);
-		buffers = NULL;
-		return AK_FAILED;
-	}
-
-	int n_buffers = 0;
-	unsigned long temp = akuio_vaddr2paddr(ion_mem) & 7;
-	/* buffer begin address must be 8-byte aligned */
-	unsigned char *ptemp = ((unsigned char *)ion_mem) + ((8-temp)&7);
-	ak_print_notice_ex("ion_mem: %p, temp: 0x%lx\n", 
-		ion_mem, akuio_vaddr2paddr(ion_mem));
-	
-	/* init buffer's data */
-	for (n_buffers = 0; n_buffers < BUFF_NUM; ++n_buffers) {
-		buffers[n_buffers].length = align_buf_size;
-		buffers[n_buffers].start = ptemp + align_buf_size * n_buffers;
-		ak_print_notice_ex("n_buffers: %d, start: %p, length: %d\n", 
-			n_buffers, buffers[n_buffers].start, buffers[n_buffers].length);
-		if (!buffers[n_buffers].start) {
-			ak_print_normal_ex("Out of memory\n");
-			return -1;
-		}
-	}
-	ak_print_normal_ex("set buffer size: %d ok\n", align_buf_size);
-
-	return AK_SUCCESS;
-}
 
 /**
  * set_buffer_size: calculate the size for isp drv buffer and set buffer size
@@ -137,37 +100,30 @@ static int malloc_capture_buffers(int align_buf_size)
  * void
  * notes:
  */
-static int set_buffer_size(int fd, enum isp_vi_status status, 
-						const int buffer_size)
+
+static int set_buffer_size(int fd, enum isp_vi_status status,
+                           const int buffer_size)
 {
-	ak_print_info_ex("enter...\n");
-	struct v4l2_requestbuffers req = {0};
-	int align_buf_size = (buffer_size + IMAGE_BUFFER_SIZE - 1) /
-		IMAGE_BUFFER_SIZE * IMAGE_BUFFER_SIZE;
+    ak_print_info_ex("enter...\n");
 
-	req.count  = BUFF_NUM;
-	req.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-	req.memory = V4L2_MEMORY_USERPTR;
+    struct v4l2_requestbuffers req;
+    CLEAR(req);
 
-	/* request bufs */
-	if (-1 == xioctl(fd, VIDIOC_REQBUFS, &req)) {
-		ak_print_normal_ex("REQBUFS failed!\n");
-		if (EINVAL == errno) {
-			ak_print_normal("%s does not support user pointer i/o\n", dev_name);
-		} else {
-			ak_print_error_ex("VIDIOC_REQBUFS, %s\n", strerror(errno));
-		}
-		return AK_FAILED;
-	}
+    req.count  = 1;
+    req.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    req.memory = V4L2_MEMORY_MMAP;
 
-	int ret = AK_FAILED;
-	if (ISP_VI_STATUS_OPEN == status) {
-		ret = malloc_capture_buffers(align_buf_size);
-	}
-	ak_print_info_ex("leave...\n");
-	
-	return ret;
+    if (xioctl(fd, VIDIOC_REQBUFS, &req) < 0) {
+        ak_print_error_ex("VIDIOC_REQBUFS failed: %s\n", strerror(errno));
+        return AK_FAILED;
+    }
+
+    ak_print_notice_ex("REQBUFS returned %d buffer(s)\n", req.count);
+    ak_print_info_ex("leave...\n");
+
+    return AK_SUCCESS;
 }
+
 
 /**
  * read_frame: read the frame buffer,if the buffer has data,return true
@@ -175,49 +131,32 @@ static int set_buffer_size(int fd, enum isp_vi_status status,
  * return: 0 on success, -1 failed.
  * notes:
  */
-static int read_frame(int fd)
+ static int read_frame(int fd)
 {
-	memset(&v4l2_buf, 0x00, sizeof(v4l2_buf));
-	v4l2_buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-	v4l2_buf.memory = V4L2_MEMORY_USERPTR;
-	v4l2_buf.m.userptr = 0;
+    struct v4l2_buffer buf;
 
-	/* dqbuf, its to call driver's get frame interface */
-	if (-1 == xioctl(fd, VIDIOC_DQBUF, &v4l2_buf)) {
-		switch (errno) {
-		case EAGAIN:
-			ak_print_normal_ex("interrupt\n");
-			return -1;
+    CLEAR(buf);
+    buf.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    buf.memory = V4L2_MEMORY_MMAP;
 
-		case EIO:
-			/* Could ignore EIO, see spec. */
-			/* fall through */
+    if (xioctl(fd, VIDIOC_DQBUF, &buf) < 0) {
+        if (errno == EAGAIN || errno == ETIMEDOUT) {
+            return -1;
+        }
+        ak_print_error_ex("VIDIOC_DQBUF failed: %s\n", strerror(errno));
+        return -1;
+    }
 
-		default:
-			ak_print_error_ex("VIDIOC_DQBUF, %s\n", strerror(errno));
-			return -1;
-		}
-	}
+    /* immediately requeue (single buffer pipeline) */
+    if (xioctl(fd, VIDIOC_QBUF, &buf) < 0) {
+        ak_print_error_ex("VIDIOC_QBUF(requeue) failed: %s\n", strerror(errno));
+        return -1;
+    }
 
-	unsigned int i = 0;
-	for (i = 0; i < BUFF_NUM; ++i) {
-		if (v4l2_buf.m.userptr == (unsigned long)buffers[i].start) {
-			/* debug code */
-#if CHECK_V4L2_DATA_HEAD
-			unsigned char *data = (void *)v4l2_buf.m.userptr;
-			for (i=0;i<32;i++) {
-				if (0==(i%16))
-					ak_print_normal("\n");
-				ak_print_normal("%02x ", data[0]);
-			}
-			ak_print_normal("\n");
-#endif
-			return 0;
-		}
-	}
-
-	return -1;
+    return 0;
 }
+
+
 
 /**
  * get_capture_cap: get the capability of capture
@@ -252,81 +191,17 @@ static int get_capture_cap(int fd)
 	return ret_cap;
 }
 
-/* api use to alloc frame buf struct */
-static struct frame_buf* alloc_frame_buf(void)
+int release_data_buf(int video0_fd, struct v4l2_buffer *buf)
 {
-	/* alloc parent struct */
-	struct frame_buf *n = (struct frame_buf *)calloc(1, sizeof(struct frame_buf));
-	if (n) {
-		/* alloc child struct */
-		n->buf = (struct v4l2_buffer *)calloc(1, sizeof(struct v4l2_buffer));
-		if (NULL == n->buf) {
-			free(n);
-			n = NULL;
-		}
-	}
-
-	if (!n) {
-		ak_print_warning_ex("calloc failed\n");
-	}
-	
-	return n;
+    (void)video0_fd;
+    (void)buf;
+    /* No-op for MMAP: buffer is requeued in read_frame() */
+    return AK_SUCCESS;
 }
 
-/* free frame buf struct memory */
-static void free_frame_buf(struct frame_buf *f)
-{
-	if (f) {
-		if (f->buf) {
-			free(f->buf);
-			f->buf = NULL;
-		}
-		
-		free(f);
-		f = NULL;
-	}
-}
 
-/**
- * release_data_buf: release the frame buffer
- * @fd[IN]: the handle of video0
- * @pbuf[IN]: buffer address
- * return: 0 success, otherwise failed
- * notes:
- */
-static int release_data_buf(int fd, void *pbuf)
-{
-	struct v4l2_buffer *v4l2_buf = pbuf;
-	memset((void *)v4l2_buf->m.userptr, 1, 31*1024);
 
-	/* set specific frame's state */
-	struct frame_buf *first = NULL;
-	list_for_each_entry(first, &v4l2_frame_list, buf_list) {
-		if (first && (first->buf == v4l2_buf))
-			first->state = FRAME_STATE_USE_OK;
-	}
-
-	/* release all first frame which state is use ok */
-	struct frame_buf *tmp = NULL;
-
-	ak_thread_mutex_lock(&isp_frame_list_lock);
-	/* only when frame state is use-ok it can do true release */
-	list_for_each_entry_safe(first, tmp, &v4l2_frame_list, buf_list) {
-		if (first->state == FRAME_STATE_USE_OK) {
-			ak_print_debug_ex("release, i = %d\n", first->buf->index);
-			if (-1 == xioctl(fd, VIDIOC_QBUF, first->buf))
-				ak_print_error_ex("VIDIOC_QBUF, %s\n", strerror(errno));
-			/* delete from list */
-			list_del(&first->buf_list);
-			free_frame_buf(first);
-		} else
-			break;	//when some one who using this frame, do release late
-	}
-	ak_thread_mutex_unlock(&isp_frame_list_lock);
-
-	return AK_SUCCESS;
-}
-
+    
 /**
  * set_v4l2_qbuf - set V4L2 query buffer
  * @fd[IN]: the handle of video0
@@ -334,32 +209,80 @@ static int release_data_buf(int fd, void *pbuf)
  * notes: the isp dev use 4 buffer to save the frame data,but when we get
  * 		frame data,just can get one buffer data
  */
+
+
+static int set_v4l2_reqbufs(int fd)
+{
+    struct v4l2_requestbuffers req;
+
+    CLEAR(req);
+    req.count  = 1;
+    req.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+   req.memory = V4L2_MEMORY_MMAP;
+
+    if (-1 == xioctl(fd, VIDIOC_REQBUFS, &req)) {
+        ak_print_error_ex("VIDIOC_REQBUFS failed: %s\n", strerror(errno));
+        return AK_FAILED;
+    }
+
+  ak_print_notice_ex("REQBUFS returned %d buffer(s)\n", req.count);
+ 
+    return AK_SUCCESS;
+}
+
+
+static int setup_mmap_buffer(int fd)
+{
+    struct v4l2_buffer buf;
+
+    CLEAR(buf);
+    buf.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    buf.memory = V4L2_MEMORY_MMAP;
+    buf.index  = 0;
+
+    if (xioctl(fd, VIDIOC_QUERYBUF, &buf) < 0) {
+        ak_print_error_ex("VIDIOC_QUERYBUF failed: %s\n", strerror(errno));
+        return AK_FAILED;
+    }
+
+    mmap_addr = mmap(NULL, buf.length,
+                     PROT_READ | PROT_WRITE,
+                     MAP_SHARED,
+                     fd,
+                     buf.m.offset);
+
+    if (mmap_addr == MAP_FAILED) {
+        ak_print_error_ex("mmap failed: %s\n", strerror(errno));
+        return AK_FAILED;
+    }
+
+    buffers[0].start  = mmap_addr;
+    buffers[0].length = buf.length;
+
+    ak_print_notice_ex("MMAP buffer mapped addr=%p len=%u\n",
+                       buffers[0].start, buffers[0].length);
+
+    return AK_SUCCESS;
+}
+
 static int set_v4l2_qbuf(int fd)
 {
-	int ret = AK_SUCCESS;
-	unsigned int i = 0;
-	struct v4l2_buffer buf;
+    struct v4l2_buffer buf;
 
-	for (i = 0; i < BUFF_NUM; ++i) {
-		CLEAR(buf);
-		buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-		buf.memory = V4L2_MEMORY_USERPTR;
-		buf.index = i;
-		buf.m.userptr = (unsigned long)buffers[i].start;
-		buf.length = buffers[i].length;
-#if 0
-		ak_print_normal_ex("i:%d, userptr:%lu, length:%d\n",
-				i, buf.m.userptr, buf.length);
-#endif
-		if (-1 == xioctl(fd, VIDIOC_QBUF, &buf)) {
-			ret = AK_FAILED;
-			ak_print_error_ex("VIDIOC_QBUF, %s, i: %d\n", strerror(errno), i);
-			break;
-		}
-	}
+    CLEAR(buf);
+    buf.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    buf.memory = V4L2_MEMORY_MMAP;
+    buf.index  = 0;
 
-	return ret;
+    if (xioctl(fd, VIDIOC_QBUF, &buf) < 0) {
+        ak_print_error_ex("VIDIOC_QBUF failed: %s\n", strerror(errno));
+        return AK_FAILED;
+    }
+
+    ak_print_notice_ex("QBUF ok (index=0)\n");
+    return AK_SUCCESS;
 }
+
 
 /**
  * set_data_buffer: set buffer for ISP drv
@@ -371,69 +294,59 @@ static int set_v4l2_qbuf(int fd)
  * notes:
  */
 static int set_data_buffer(int fd, enum isp_vi_status status,
-						const int buffer_size)
+                           const int buffer_size)
 {
-	set_buffer_size(fd, status, buffer_size);
+    if (!buffers) {
+        buffers = calloc(1, sizeof(struct buffer));
+        if (!buffers) {
+            ak_print_error_ex("no memory for buffers\n");
+            return AK_FAILED;
+        }
+    }
 
-	return set_v4l2_qbuf(fd);
+    if (set_buffer_size(fd, status, buffer_size) != AK_SUCCESS)
+        return AK_FAILED;
+
+    if (set_v4l2_reqbufs(fd) != AK_SUCCESS)
+        return AK_FAILED;
+
+    if (setup_mmap_buffer(fd) != AK_SUCCESS)
+        return AK_FAILED;
+
+    return set_v4l2_qbuf(fd);
 }
 
-/* get frame from driver */
+
+
 static struct v4l2_buffer* get_v4l2_ptr(void)
 {
-#if CALC_VI_CAP_TIME
-	struct ak_timeval tv_start;
-	struct ak_timeval tv_end;
-	ak_get_ostime(&tv_start);
-#endif
+    static struct v4l2_buffer ret_buf;
+    fd_set fds;
+    struct timeval tv;
+    int ret;
 
-	/* timeout dealwith */
-	fd_set fds;
-	struct timeval tv;
-	struct v4l2_buffer *tmp_buf = NULL;
-	struct frame_buf *frame = NULL;
-	
-	tv.tv_sec = 2;
-	tv.tv_usec = 0;
-	FD_ZERO(&fds);
-	FD_SET(video0_fd, &fds);
+    FD_ZERO(&fds);
+    FD_SET(video0_fd, &fds);
 
-	int ret = select(video0_fd + 1, &fds, NULL, NULL, &tv);
-	switch (ret) {
-	case -1:
-		ak_print_error_ex("select error\n");
-		goto get_v4l2_end;
-	case 0:
-		/* when timeout,return failed to user */
-		ak_print_error_ex("select timeout!\n");
-#if CALC_VI_CAP_TIME
-		ak_get_ostime(&tv_end);
-		ak_print_notice_ex("timeout use: %ld(ms), ret: %ld(s), %ld(us)\n",
-			ak_diff_ms_time(&tv_end, &tv_start), tv.tv_sec, tv.tv_usec);
-#endif
-		goto get_v4l2_end;
-	default:
-		if (read_frame(video0_fd)) {	//we should almost run to here
-			ak_print_notice_ex("read frame failed\n");
-			goto get_v4l2_end;
-		}
+    tv.tv_sec = 2;
+    tv.tv_usec = 0;
 
-		/* get frame ok, store to frame list */
-		frame = alloc_frame_buf();
-		if (frame) {
-			memcpy(frame->buf, &v4l2_buf, sizeof(struct v4l2_buffer));
-			frame->state = FRAME_STATE_USING;
-			ak_thread_mutex_lock(&isp_frame_list_lock);
-			list_add_tail(&frame->buf_list, &v4l2_frame_list);
-			ak_thread_mutex_unlock(&isp_frame_list_lock);
-			tmp_buf = frame->buf;
-		}
-		break;
-	}
+    ret = select(video0_fd + 1, &fds, NULL, NULL, &tv);
+    if (ret <= 0)
+        return NULL;
 
-get_v4l2_end:
-	return tmp_buf;
+    if (read_frame(video0_fd) != 0)
+        return NULL;
+
+    CLEAR(ret_buf);
+    ret_buf.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    ret_buf.memory = V4L2_MEMORY_MMAP;
+    ret_buf.index  = 0;
+    ret_buf.length = buffers[0].length;
+
+    return &ret_buf;
 }
+
 
 #if ISP_CHECK_FRAME_TS
 /* check frame ts, incase of ts = 0 or ts rollback */
@@ -588,36 +501,33 @@ int isp_vi_set_main_attr(const int width, const int height)
  */
 int isp_vi_set_sub_attr(const int width, const int height)
 {
-	/* camera private cid & data defined*/
-	/***********************************/
-	
+    struct pcid_ch2_output_fmt_data {
+        int type;
+        int width;
+        int height;
+    };
 
-	struct pcid_ch2_output_fmt_data {
-		int type;
-		int width;
-		int height;
-	};
-	/***********************************/
+    struct pcid_ch2_output_fmt_data *ch2_fmt;
+    struct v4l2_streamparm parm;
 
-	int ret = AK_SUCCESS;
-	struct pcid_ch2_output_fmt_data *ch2_fmt;
-	struct v4l2_streamparm parm;
+    CLEAR(parm);
+    parm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
 
-	CLEAR(parm);
-	parm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    ch2_fmt = (struct pcid_ch2_output_fmt_data *)parm.parm.raw_data;
+    ch2_fmt->type   = PCID_CH2_OUTPUT_FMT;
+    ch2_fmt->width  = width;
+    ch2_fmt->height = height;
 
-	ch2_fmt = (struct pcid_ch2_output_fmt_data *)parm.parm.raw_data;
-	ch2_fmt->type = PCID_CH2_OUTPUT_FMT;
-	ch2_fmt->width = width;
-	ch2_fmt->height = height;
+    /* Anyka IPC kernel does not support VIDIOC_S_PARM on sub channel */
+    if (0 != xioctl(video0_fd, VIDIOC_S_PARM, &parm)) {
+        ak_print_notice_ex(
+            "VIDIOC_S_PARM not supported on sub channel, ignore\n"
+        );
+    }
 
-	if ( 0 != xioctl(video0_fd, VIDIOC_S_PARM, &parm)) {
-		ret = AK_FAILED;
-		ak_print_error_ex("VIDIOC_S_PARM fail!!!\n");
-	}
-
-	return ret;
+    return AK_SUCCESS;
 }
+
 
 /**
  * isp_vi_get_raw_data: send cmd to get raw data
@@ -730,49 +640,29 @@ int isp_vi_set_fps(const int fps)
  */
 int isp_vi_capture_on(enum isp_vi_status status, const int buffer_size)
 {
-	ak_print_info_ex("enter..., camera_lost_frame=%d\n", camera_lost_frame);
-	/* on and off should only call once */
-	if (!camera_lost_frame) {
-		return AK_SUCCESS;
-	}
 
-	/* set 4 buffer for isp driver */
-	set_data_buffer(video0_fd, status, buffer_size);
+    ak_print_info_ex("enter..., camera_lost_frame=%d\n", camera_lost_frame);
 
-	/* open capture */
-	enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-	if (-1 == xioctl(video0_fd, VIDIOC_STREAMON, &type)) {
-		ak_print_error_ex("STREAMON failed, %s\n", strerror(errno));
-		return AK_FAILED;
-	}
+    if (!camera_lost_frame) {
+        return AK_SUCCESS;
+    }
 
-	/* drop first n frames */
-	ak_print_notice_ex("stream on, drop first %d frames\n", camera_lost_frame);
-	
-	while (camera_lost_frame > 0) {
-		ak_thread_mutex_lock(&isp_manipulate_mutex_lock);
-		struct v4l2_buffer *frame_ptr = get_v4l2_ptr();
-		if (NULL == frame_ptr) {
-			ak_print_error_ex("get v4l2 frame ptr failed!\n");
-			ak_thread_mutex_unlock(&isp_manipulate_mutex_lock);
-			return AK_FAILED;
-		}
+    /* set buffers */
+    set_data_buffer(video0_fd, status, buffer_size);
 
-#if ISP_FRAME_DEBUG
-		unsigned long long ts = frame_ptr->timestamp.tv_sec * 1000ULL
-			+ frame_ptr->timestamp.tv_usec / 1000ULL;
-		ak_print_info_ex("drop frame %d, ts=%llu\n", camera_lost_frame, ts);
-#endif
+  enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
 
-		release_data_buf(video0_fd, frame_ptr);
-		camera_lost_frame--;
-		ak_thread_mutex_unlock(&isp_manipulate_mutex_lock);
-	}
-	ak_get_ostime(&frame_tv_start);
-
-	ak_print_info_ex("leave...\n");
-	return AK_SUCCESS;
+if (xioctl(video0_fd, VIDIOC_STREAMON, &type) < 0) {
+    ak_print_error_ex("STREAMON failed: %s\n", strerror(errno));
+    return AK_FAILED;
 }
+     
+
+     ak_print_info_ex("leave...\n");
+
+    return AK_SUCCESS;
+}
+
 
 /**
  * isp_vi_capture_off: close isp capture
@@ -797,36 +687,24 @@ int isp_vi_capture_off(enum isp_vi_status status)
 			free(buffers);
 			buffers = NULL;
 		}
-		if (ion_mem) {
-			ak_print_notice_ex("free pmem=%p\n", ion_mem);
-			akuio_free_pmem(ion_mem);
-			ion_mem = NULL;
-		}
-	}
+		
 
 	return AK_SUCCESS;
 }
 
-static void raw_data_save(unsigned char* buf, unsigned int size)
+
+static void raw_data_save(unsigned char *buf, unsigned int size)
 {
-    FILE *fd = NULL;
-    int len = size;
-
-    fd = fopen(RAW_SAVE_PATH, "w+b");
-   
-  	if (NULL == fd)
-  	{
-  		ak_print_error("raw file create failed.\n");
-      	return;
-  	}
-
-    do {
-      	len -= fwrite(buf + size - len, 1, len, fd);
+    FILE *fd = fopen(RAW_SAVE_PATH, "wb");
+    if (!fd) {
+        ak_print_error("raw file create failed\n");
+        return;
     }
-    while (len > 0);
 
-	fclose(fd);
+    fwrite(buf, 1, size, fd);
+    fclose(fd);
 }
+
 
 
 /**
@@ -881,7 +759,9 @@ int isp_vi_get_frame(struct isp_frame *frame)
 
 	/* assignment */
 	frame->private_data = frame_ptr;
-	frame->buf = (void *)frame_ptr->m.userptr;
+	
+	frame->buf = buffers[0].start;
+
 	frame->ts = frame_ptr->timestamp.tv_sec * 1000ULL
 		+ frame_ptr->timestamp.tv_usec / 1000ULL;
 	frame->seq_no = frame_ptr_seq_no;
@@ -929,17 +809,6 @@ int isp_vi_get_frame(struct isp_frame *frame)
 	} else {
 		/* drop some useless frame because its ts=0  */
 		ak_print_notice_ex("seq_no=%ld, frame->ts=%llu, we had dropped it!\n",
-			frame->seq_no, frame->ts);
-		isp_vi_release_frame(frame->private_data);
-	}
-
-	/* debug code */
-#if ISP_CHECK_FRAME_TS
-	check_frame_ts(frame);
-#endif	
-
-	return ret;
-}
 
 /**
  * isp_vi_reset_drop_frame: reset vi isp drop frame count
@@ -975,18 +844,13 @@ int isp_vi_stream_ctrl_on(void)
 
 	fflush(stdout);
 	CLEAR(req);
-	req.count  = BUFF_NUM;
+	req.count  = 1;
 	req.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-	req.memory = V4L2_MEMORY_USERPTR;
+	req.memory = V4L2_MEMORY_MMAP;
 	/* request buf */
 	if (-1 == xioctl(video0_fd, VIDIOC_REQBUFS, &req)) {
 		ak_print_normal_ex("REQBUFS failed!\n");
-		if (EINVAL == errno) {
-			ak_print_normal("%s does not support user pointer i/o\n", dev_name);
-			return -1;
-		} else {
-			ak_print_error_ex("VIDIOC_REQBUFS, %s\n", strerror(errno));
-			return -1;
+		
 		}
 	}
 
@@ -996,18 +860,25 @@ int isp_vi_stream_ctrl_on(void)
 
 	/* open capture */
 	if (-1 == xioctl(video0_fd, VIDIOC_STREAMON, &type)) {
-		ak_print_error_ex("STREAMON failed, %s\n", strerror(errno));
+		ak_print_error_ex("STREAMON failed, %s\n", strerror(er
+			frame->seq_no, frame->ts);
+		isp_vi_release_frame(frame->private_data);
+	}
+
+	/* debug code */
+#if ISP_CHECK_FRAME_TS
+	check_frame_ts(frame);
+#endif	
+
+	return ret;
+}rno));
 		return AK_FAILED;
 	}
 
 	return AK_SUCCESS;
 }
 
-/**
- * isp_vi_stream_ctrl_off: close capture
- * return: 0 success, otherwise failed
- * notes:
- */
+
 int isp_vi_stream_ctrl_off(void)
 {
 	enum v4l2_buf_type type;
@@ -1019,7 +890,7 @@ int isp_vi_stream_ctrl_off(void)
 		return AK_FAILED;
 	} else {
 		ak_print_normal("STREAMOFF succeedded!\n");
-		camera_lost_frame = BUFF_NUM + 1;
+		camera_lost_frame = DEFAULT_DROP_FRAME_NUM;
 	}
 
 	return AK_SUCCESS;
