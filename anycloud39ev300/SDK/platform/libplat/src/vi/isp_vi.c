@@ -72,7 +72,7 @@ static unsigned int drop_isp_frame = (BUFF_NUM - 1);
 static pthread_mutex_t isp_manipulate_mutex_lock = PTHREAD_MUTEX_INITIALIZER;
 //static pthread_mutex_t isp_frame_list_lock = PTHREAD_MUTEX_INITIALIZER;
 /* buffer memory address */
-
+static void *ion_mem = NULL;
 /* video device name */
 static char *dev_name = "/dev/video0";
 /* drop some of first frame */
@@ -92,6 +92,48 @@ static int xioctl(int fd, int request, void *arg)
 	return ret;
 }
 
+static int malloc_capture_buffers(int align_buf_size)
+{
+	/* allocate buffers memory */
+	buffers = calloc(BUFF_NUM, sizeof(struct buffer));
+	if (!buffers) {
+		ak_print_normal_ex("Out of memory\n");
+		return AK_FAILED;
+	}
+
+	/* init frame buf's dma buf */
+	int ion_size = align_buf_size * BUFF_NUM;
+	ion_mem = akuio_alloc_pmem(ion_size);
+	if (!ion_mem) {
+		ak_print_normal_ex("Allocate %d bytes failed\n", ion_size);
+		free(buffers);
+		buffers = NULL;
+		return AK_FAILED;
+	}
+
+	int n_buffers = 0;
+	unsigned long temp = akuio_vaddr2paddr(ion_mem) & 7;
+	/* buffer begin address must be 8-byte aligned */
+	unsigned char *ptemp = ((unsigned char *)ion_mem) + ((8-temp)&7);
+	ak_print_notice_ex("ion_mem: %p, temp: 0x%lx\n", 
+		ion_mem, akuio_vaddr2paddr(ion_mem));
+	
+	/* init buffer's data */
+	for (n_buffers = 0; n_buffers < BUFF_NUM; ++n_buffers) {
+		buffers[n_buffers].length = align_buf_size;
+		buffers[n_buffers].start = ptemp + align_buf_size * n_buffers;
+		ak_print_notice_ex("n_buffers: %d, start: %p, length: %d\n", 
+			n_buffers, buffers[n_buffers].start, buffers[n_buffers].length);
+		if (!buffers[n_buffers].start) {
+			ak_print_normal_ex("Out of memory\n");
+			return -1;
+		}
+	}
+	ak_print_normal_ex("set buffer size: %d ok\n", align_buf_size);
+
+	return AK_SUCCESS;
+}
+
 
 /**
  * set_buffer_size: calculate the size for isp drv buffer and set buffer size
@@ -100,30 +142,37 @@ static int xioctl(int fd, int request, void *arg)
  * void
  * notes:
  */
-
-static int set_buffer_size(int fd, enum isp_vi_status status,
-                           const int buffer_size)
+static int set_buffer_size(int fd, enum isp_vi_status status, 
+						const int buffer_size)
 {
-    ak_print_info_ex("enter...\n");
+	ak_print_info_ex("enter...\n");
+	struct v4l2_requestbuffers req = {0};
+	int align_buf_size = (buffer_size + IMAGE_BUFFER_SIZE - 1) /
+		IMAGE_BUFFER_SIZE * IMAGE_BUFFER_SIZE;
 
-    struct v4l2_requestbuffers req;
-    CLEAR(req);
+	req.count  = 1;
+	req.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+	req.memory = V4L2_MEMORY_MMAP;
 
-    req.count  = 1;
-    req.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    req.memory = V4L2_MEMORY_MMAP;
+	/* request bufs */
+	if (-1 == xioctl(fd, VIDIOC_REQBUFS, &req)) {
+		ak_print_normal_ex("REQBUFS failed!\n");
+		if (EINVAL == errno) {
+			ak_print_normal("%s does not support user pointer i/o\n", dev_name);
+		} else {
+			ak_print_error_ex("VIDIOC_REQBUFS, %s\n", strerror(errno));
+		}
+		return AK_FAILED;
+	}
 
-    if (xioctl(fd, VIDIOC_REQBUFS, &req) < 0) {
-        ak_print_error_ex("VIDIOC_REQBUFS failed: %s\n", strerror(errno));
-        return AK_FAILED;
-    }
-
-    ak_print_notice_ex("REQBUFS returned %d buffer(s)\n", req.count);
-    ak_print_info_ex("leave...\n");
-
-    return AK_SUCCESS;
+	int ret = AK_FAILED;
+	if (ISP_VI_STATUS_OPEN == status) {
+		ret = malloc_capture_buffers(align_buf_size);
+	}
+	ak_print_info_ex("leave...\n");
+	
+	return ret;
 }
-
 
 /**
  * read_frame: read the frame buffer,if the buffer has data,return true
@@ -294,28 +343,20 @@ static int set_v4l2_qbuf(int fd)
  * notes:
  */
 static int set_data_buffer(int fd, enum isp_vi_status status,
-                           const int buffer_size)
+						const int buffer_size)
 {
-    if (!buffers) {
-        buffers = calloc(1, sizeof(struct buffer));
-        if (!buffers) {
-            ak_print_error_ex("no memory for buffers\n");
-            return AK_FAILED;
-        }
-    }
+	if (set_buffer_size(fd, status, buffer_size) != AK_SUCCESS)
+    return AK_FAILED;
 
-    if (set_buffer_size(fd, status, buffer_size) != AK_SUCCESS)
-        return AK_FAILED;
+if (set_v4l2_reqbufs(fd) != AK_SUCCESS)
+    return AK_FAILED;
 
-    if (set_v4l2_reqbufs(fd) != AK_SUCCESS)
-        return AK_FAILED;
+if (setup_mmap_buffer(fd) != AK_SUCCESS)
+    return AK_FAILED;
 
-    if (setup_mmap_buffer(fd) != AK_SUCCESS)
-        return AK_FAILED;
+return set_v4l2_qbuf(fd);
 
-    return set_v4l2_qbuf(fd);
 }
-
 
 
 static struct v4l2_buffer* get_v4l2_ptr(void)
@@ -651,11 +692,8 @@ int isp_vi_capture_on(enum isp_vi_status status, const int buffer_size)
     set_data_buffer(video0_fd, status, buffer_size);
 
   enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+xioctl(video0_fd, VIDIOC_STREAMON, &type);
 
-if (xioctl(video0_fd, VIDIOC_STREAMON, &type) < 0) {
-    ak_print_error_ex("STREAMON failed: %s\n", strerror(errno));
-    return AK_FAILED;
-}
      
 
      ak_print_info_ex("leave...\n");
@@ -687,24 +725,36 @@ int isp_vi_capture_off(enum isp_vi_status status)
 			free(buffers);
 			buffers = NULL;
 		}
-		
+		if (ion_mem) {
+			ak_print_notice_ex("free pmem=%p\n", ion_mem);
+			akuio_free_pmem(ion_mem);
+			ion_mem = NULL;
+		}
+	}
 
 	return AK_SUCCESS;
 }
 
-
-static void raw_data_save(unsigned char *buf, unsigned int size)
+static void raw_data_save(unsigned char* buf, unsigned int size)
 {
-    FILE *fd = fopen(RAW_SAVE_PATH, "wb");
-    if (!fd) {
-        ak_print_error("raw file create failed\n");
-        return;
+    FILE *fd = NULL;
+    int len = size;
+
+    fd = fopen(RAW_SAVE_PATH, "w+b");
+   
+  	if (NULL == fd)
+  	{
+  		ak_print_error("raw file create failed.\n");
+      	return;
+  	}
+
+    do {
+      	len -= fwrite(buf + size - len, 1, len, fd);
     }
+    while (len > 0);
 
-    fwrite(buf, 1, size, fd);
-    fclose(fd);
+	fclose(fd);
 }
-
 
 
 /**
@@ -809,6 +859,17 @@ int isp_vi_get_frame(struct isp_frame *frame)
 	} else {
 		/* drop some useless frame because its ts=0  */
 		ak_print_notice_ex("seq_no=%ld, frame->ts=%llu, we had dropped it!\n",
+			frame->seq_no, frame->ts);
+		isp_vi_release_frame(frame->private_data);
+	}
+
+	/* debug code */
+#if ISP_CHECK_FRAME_TS
+	check_frame_ts(frame);
+#endif	
+
+	return ret;
+}
 
 /**
  * isp_vi_reset_drop_frame: reset vi isp drop frame count
@@ -850,7 +911,12 @@ int isp_vi_stream_ctrl_on(void)
 	/* request buf */
 	if (-1 == xioctl(video0_fd, VIDIOC_REQBUFS, &req)) {
 		ak_print_normal_ex("REQBUFS failed!\n");
-		
+		if (EINVAL == errno) {
+			ak_print_normal("%s does not support user pointer i/o\n", dev_name);
+			return -1;
+		} else {
+			ak_print_error_ex("VIDIOC_REQBUFS, %s\n", strerror(errno));
+			return -1;
 		}
 	}
 
@@ -860,25 +926,18 @@ int isp_vi_stream_ctrl_on(void)
 
 	/* open capture */
 	if (-1 == xioctl(video0_fd, VIDIOC_STREAMON, &type)) {
-		ak_print_error_ex("STREAMON failed, %s\n", strerror(er
-			frame->seq_no, frame->ts);
-		isp_vi_release_frame(frame->private_data);
-	}
-
-	/* debug code */
-#if ISP_CHECK_FRAME_TS
-	check_frame_ts(frame);
-#endif	
-
-	return ret;
-}rno));
+		ak_print_error_ex("STREAMON failed, %s\n", strerror(errno));
 		return AK_FAILED;
 	}
 
 	return AK_SUCCESS;
 }
 
-
+/**
+ * isp_vi_stream_ctrl_off: close capture
+ * return: 0 success, otherwise failed
+ * notes:
+ */
 int isp_vi_stream_ctrl_off(void)
 {
 	enum v4l2_buf_type type;
