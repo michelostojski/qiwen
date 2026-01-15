@@ -20,6 +20,7 @@ ifeq ($(CONFIG_RTSP_SUPPORT), y)
 	CFLAGS += -DCONFIG_RTSP_SUPPORT=1
 endif
 
+export CFLAGS
 
 ifeq ($(CONFIG_DANA_SUPPORT)_$(CONFIG_RTSP_SUPPORT), y_y)
 	dir_y += product_test

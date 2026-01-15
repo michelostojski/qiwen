@@ -4,6 +4,7 @@ export TARGET_DIR
 
 AKIPC_INNER_INC := $(CUR_DIR)/include
 CFLAGS += $(addprefix -I,$(AKIPC_INNER_INC))
+export CFLAGS
 
 dir_y := main
 dir_y += misc
