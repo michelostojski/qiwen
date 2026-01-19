@@ -79,6 +79,18 @@ static void rtsp_venc_set_bps(void *venc_handle,
  */
 static void *video_encode_init(enum rtsp_channel index)
 {
+ // Hard guard to validate resolution parameters
+    if (_rtsp_ctrl_param.rtsp_chn[index].width == 0 ||
+        _rtsp_ctrl_param.rtsp_chn[index].height == 0) {
+        ak_print_error(
+            "RTSP: invalid resolution rtsp_ch=%d %dx%d\n",
+            index,
+            _rtsp_ctrl_param.rtsp_chn[index].width,
+            _rtsp_ctrl_param.rtsp_chn[index].height
+        );
+        return NULL;
+    }
+
 	struct encode_param param = {0};
 
 	param.width   = _rtsp_ctrl_param.rtsp_chn[index].width;;
@@ -139,7 +151,11 @@ const char* ak_rtsp_get_version(void)
 	return rtsp_version;
 }
 
-
+static inline int rtsp_ch_to_vi_ch(int rtsp_ch)
+{
+    /* RTSP ch 0 = main, RTSP ch 1 = sub */
+    return rtsp_ch;
+}
 
 static AK_void _buffer_aenc (AK_Thread th, AK_int argc, AK_voidptr argv[]) {
 
@@ -259,19 +275,52 @@ static AK_void _buffer_venc (AK_Thread th, AK_int argc, AK_voidptr argv[]) {
  */
 int ak_rtsp_init(struct rtsp_param *param)
 {
-	char ac_iface[LEN_IFACE], ac_ip[LEN_IP], ac_rtsp[LEN_LINK];
-	AK_int argc = 0;
-	AK_voidptr argv[32];
-	AK_int i = 0;
-	AK_int registry = 0;
-	AK_int port = 554;
+    char ac_iface[LEN_IFACE], ac_ip[LEN_IP], ac_rtsp[LEN_LINK];
+    AK_int argc = 0;
+    AK_voidptr argv[32];
+    AK_int i = 0;
+    AK_int registry = 0;
+    AK_int port = 554;
 
-	AK_EXPECT_RETURN_VAL (AK_null == _Heap, AK_FAILED);
+    //AK_EXPECT_RETURN_VAL(AK_null == _Heap, AK_FAILED);
+     if (_Heap != AK_null) {
+    ak_print_notice("RTSP already initialized, skipping\n");
+    return 0;
+}
+if (registry <= 0) {
+    ak_print_error_ex("RTSP register url failed\n");
+    ak_rtsp_exit();   // <-- IMPORTANT
+    return -1;
+}
 
-	if (!param) {
-		ak_print_error_ex("invalid argument\n");
-		return -1;
-	}
+    if (!param) {
+        ak_print_error_ex("invalid argument\n");
+        return -1;
+    }
+
+    /* ===================== DEFENSIVE CHECK (HERE) ===================== */
+    for (i = 0; i < RTSP_CHANNEL_NUM; i++) {
+        if (param->rtsp_chn[i].width == 0 ||
+            param->rtsp_chn[i].height == 0) {
+
+            ak_print_error_ex(
+                "RTSP init too early: ch=%d invalid resolution %dx%d\n",
+                i,
+                param->rtsp_chn[i].width,
+                param->rtsp_chn[i].height
+            );
+            return -1;
+        }
+
+        if (!param->rtsp_chn[i].vi_handle) {
+            ak_print_error_ex(
+                "RTSP init too early: ch=%d vi_handle is NULL\n", i
+            );
+            return -1;
+        }
+    }
+    /* ================================================================ */
+
 
 	/// 初始化栈分配器。
 	_Heap = akae_malloc_create (AK_true, _heap, sizeof (_heap));
@@ -304,7 +353,9 @@ int ak_rtsp_init(struct rtsp_param *param)
 
 		/// 创建后台线程缓冲编码数据。
 		argc = 0;
-		argv[argc++] = (AK_voidptr)(i);
+		argv[argc++] = (AK_voidptr)(intptr_t)i;
+
+
 		_VStreamTH[i] = akae_thread_create_default2 (_buffer_venc, argc, argv);
 		AK_ASSERT (_VStreamTH[i] > 0);
 
@@ -327,6 +378,8 @@ int ak_rtsp_init(struct rtsp_param *param)
 
 	return 0;
 }
+
+
 
 /**
  * @deprecated >= 1.9.00
