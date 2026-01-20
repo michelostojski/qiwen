@@ -26,7 +26,7 @@
 #define IP_PA_START             (0x20020000)	//IP start addr
 #define IP_PA_LEN               (0x10000)		//64k
 //#define VENC_CFG_PATH		    "/etc/jffs2/venc.cfg"
-static char _cfg_path[64] = "/etc/jffs2/venc.cfg";
+static char _cfg_path[64] = "/mnt/jffs2/venc.cfg";
 #define VENC_CFG_PATH		    _cfg_path
 
 #define VENC_GET_STREAM_DEBUG	(0)
@@ -49,6 +49,11 @@ static char _cfg_path[64] = "/etc/jffs2/venc.cfg";
 
 #define SMOOTH_TS_DEBUG			(0)	//smooth timestamp debug
 #define USE_LIB_V1				(0)	//encode lib v1 macro
+
+static T_AKVLIB_PAR g_akv_default_params;
+static int g_akv_defaults_inited = 0;
+
+
 
 /* stat venc info */
 struct venc_stat {
@@ -332,6 +337,13 @@ static int venc_encoder_init(void)
 	init_cb_fun.ak_FunSemaphoreGet = (AKV_CB_FUN_SEMAPHORE_GET)venc_cb_sem_wait;
 	init_cb_fun.ak_FunSemaphoreRelease =
 		(AKV_CB_FUN_SEMAPHORE_RELEASE)venc_cb_sem_post;
+
+if (!g_akv_defaults_inited) {
+    memset(&g_akv_default_params, 0, sizeof(g_akv_default_params));
+    //AKV_Encoder_Get_Parameters(NULL, &g_akv_default_params);
+    g_akv_defaults_inited = 1;
+}
+
 
 #if USE_LIB_V1
 	init_cb_fun.ak_FunEventCreate = (AKV_CB_FUN_EVENT_CREATE)venc_cb_create_event;
@@ -1786,38 +1798,7 @@ static int start_service_work(void *vi)
 	return 0;
 }
 
-#if 0
-static void *wait_irq_thread(void *arg)
-{
-	ak_print_normal_ex(MPI_VENC "entry\n");
-	ak_thread_set_name("venc_wait_irq");
 
-	while (video_ctrl.wait_irq_runflg) {
-		int irq_state = -1;
-
-		akuio_wait_irq(&irq_state);
-		/*
-		 ak_print_normal_ex(MPI_VENC "irq_state: %d\n", irq_state);
-		 */
-		if (video_ctrl.wait_irq_runflg)
-			AKV_Encoder_Interrupt_Handler(irq_state);
-	}
-
-	ak_print_normal_ex(MPI_VENC "exit\n");
-	ak_thread_exit();
-	return NULL;
-}
-
-static void start_wait_irq_thread(void)
-{
-	video_ctrl.wait_irq_runflg = 1;
-	ak_thread_create(&video_ctrl.wait_irq_thid, wait_irq_thread, NULL,
-			ANYKA_THREAD_NORMAL_STACK_SIZE, -1);
-
-	/* test */
-	ak_print_notice_ex(MPI_VENC "free dma size: %lu\n", akuio_get_free_pmem());
-}
-#endif
 
 static int venc_init_open_param(T_AKV_ENC_OPEN_INPUT *open_input,
 		const struct encode_param *param)
@@ -1892,8 +1873,7 @@ static int venc_init_open_param(T_AKV_ENC_OPEN_INPUT *open_input,
 
 	open_input->AkvParams.GopLength = param->goplen;
 	open_input->AkvParams.GopNumB   = 0;	//no B frame
-	open_input->AkvParams.NumSlices = 1;	//[1, 10]
-	open_input->AkvParams.SmartMode = 0;	//init for disable
+        open_input->AkvParams.SmartMode = 0;	//init for disable
 
 	return AK_SUCCESS;
 }
@@ -1932,112 +1912,142 @@ int ak_venc_set_cfg_path (const char *path) {
  */
 void* ak_venc_open(const struct encode_param *param)
 {
-	if (!param) {
-		ak_print_error_ex(MPI_VENC "invalid param: %p\n", param);
-		set_error_no(ERROR_TYPE_INVALID_ARG);
-		return NULL;
-	}
+    if (!param) {
+        ak_print_error_ex(MPI_VENC "invalid param: %p\n", param);
+        set_error_no(ERROR_TYPE_INVALID_ARG);
+        return NULL;
+    }
 
-	ak_thread_mutex_lock(&close_lock);
-	ak_thread_mutex_lock(&video_ctrl.lock);
-	/* init model global handle member */
-	if (!video_ctrl.module_init) {
-		video_ctrl.module_init = AK_TRUE;
-		/* register encode callback, init video encoder */
-		if (!venc_encoder_init()) {
-			video_ctrl.module_init = AK_FALSE;
-			ak_thread_mutex_unlock(&video_ctrl.lock);
-			ak_thread_mutex_unlock(&close_lock);
-			set_error_no(ERROR_TYPE_DEV_OPEN_FAILED);
-			return NULL;
-		}
-		INIT_LIST_HEAD(&video_ctrl.venc_list);
-		ak_thread_mutex_init(&video_ctrl.cancel_mutex, NULL);
+    ak_thread_mutex_lock(&close_lock);
+    ak_thread_mutex_lock(&video_ctrl.lock);
 
-		venc_sys_ipc_register();
-	}
+    if (!video_ctrl.module_init) {
+        video_ctrl.module_init = AK_TRUE;
+        if (!venc_encoder_init()) {
+            video_ctrl.module_init = AK_FALSE;
+            ak_thread_mutex_unlock(&video_ctrl.lock);
+            ak_thread_mutex_unlock(&close_lock);
+            set_error_no(ERROR_TYPE_DEV_OPEN_FAILED);
+            return NULL;
+        }
+        INIT_LIST_HEAD(&video_ctrl.venc_list);
+        ak_thread_mutex_init(&video_ctrl.cancel_mutex, NULL);
+        venc_sys_ipc_register();
+    }
 
-	/* init specifically handle's resource */
-	int index = param->enc_grp;
-	int venc_init_ret = venc_handle_init(index);
-	ak_thread_mutex_unlock(&video_ctrl.lock);
-	if (venc_init_ret){
-		ak_thread_mutex_unlock(&close_lock);
-		return NULL;
-	}
+    int type = param->enc_grp;
+    if (venc_handle_init(type)) {
+        ak_print_error("VENC ERROR: step venc_handle_init failed, grp=%d\n", type);
+        ak_thread_mutex_unlock(&video_ctrl.lock);
+        ak_thread_mutex_unlock(&close_lock);
+        return NULL;
+    }
+    ak_thread_mutex_unlock(&video_ctrl.lock);
 
-	/* init encode handle */
-	int type = param->enc_grp;
-	struct encode_group *ret_handle = NULL;
-	ak_print_normal_ex(MPI_VENC "now init type %d\n", type);
+    struct encode_group *enc_handle = video_ctrl.grp[type];
+    struct encode_group *ret_handle = NULL;
 
-	/* to make multiple thread operate safe */
-	struct encode_group *enc_handle = video_ctrl.grp[type];
+    ak_thread_mutex_lock(&enc_handle->lock);
 
-	ak_thread_mutex_lock(&enc_handle->lock);
-	if(enc_handle->user_count > 0) {
-		add_user(enc_handle);
-		ret_handle = enc_handle;
-		ak_print_normal_ex(MPI_VENC "add user ...\n");
-		goto venc_open_end;
-	}
+    if (enc_handle->user_count > 0) {
+        add_user(enc_handle);
+        ret_handle = enc_handle;
+        goto venc_open_end;
+    }
 
-	/* open new encode group handle */
-	int encode_output_buffer_len = ENC_OUT_MAX_SZ;
-	if (param->use_chn == ENCODE_SUB_CHN)
-		encode_output_buffer_len /= 2;
+    enc_handle->encbuf = calloc(1, ENC_OUT_MAX_SZ);
+    memcpy(&enc_handle->record, param, sizeof(*param));
+/* ---------- AKV OPEN INPUT ---------- */
+T_AKV_ENC_OPEN_INPUT open_input;
+memset(&open_input, 0, sizeof(open_input));
 
-	enc_handle->encbuf = (unsigned char *)calloc(1, encode_output_buffer_len);
-	enc_handle->record.br_mode = param->br_mode;
-	memcpy(&enc_handle->record, param, sizeof(struct encode_param));
+/* STEP 1: MUST initialize AKV defaults */
+AKV_Encoder_Get_Parameters(NULL, &open_input.AkvParams);
 
-	/* init input param */
-	T_AKV_ENC_OPEN_INPUT open_input = {0};
-	AKV_Encoder_Get_Parameters(NULL, &open_input.AkvParams);
-	if (venc_init_open_param(&open_input, param)){
-		free(enc_handle->encbuf);
-		enc_handle->encbuf = NULL;
-		ak_print_error_ex(MPI_VENC "venc_init_open_param failed!\n");
-		goto venc_open_end;
-	}
+/* STEP 2: NEVER read venc.cfg */
+open_input.sCfgFileName = NULL;
 
-	enc_handle->lib_handle = AKV_Encoder_Open(&open_input);
-	if (!enc_handle->lib_handle) {
-		free(enc_handle->encbuf);
-		enc_handle->encbuf = NULL;
-		ak_print_error_ex(MPI_VENC "AKV_Encoder_Open failed!\n");
-		set_error_no(ERROR_TYPE_MEDIA_LIB_FAILED);
-		goto venc_open_end;
-	}
+/* STEP 3: mandatory base parameters */
+open_input.AkvParams.FrameWidth  = param->width;
+open_input.AkvParams.FrameHeight = param->height;
 
-	ak_print_notice_ex(MPI_VENC "Video encoder open success\n");
-	ak_print_normal_ex(MPI_VENC "\n\tparams: w=%d, h=%d, qpmin=%d, qpmax=%d,"
-		"bps=%d, gop=%u, fps=%u, profile=%d\n",
-		open_input.AkvParams.FrameWidth,
-		open_input.AkvParams.FrameHeight,
-		open_input.AkvParams.MinQP,
-	   	open_input.AkvParams.MaxQP,
-		open_input.AkvParams.TargetBitRate,
-	   	open_input.AkvParams.GopLength,
-		open_input.AkvParams.EncFrameRate,
-		open_input.AkvParams.eProfile);
+/* HARD GUARD */
+if (open_input.AkvParams.FrameWidth < 64 ||
+    open_input.AkvParams.FrameHeight < 64) {
+    ak_print_error("Invalid resolution %dx%d\n",
+        open_input.AkvParams.FrameWidth,
+        open_input.AkvParams.FrameHeight);
+    goto venc_open_end;
+}
 
-	INIT_LIST_HEAD(&(enc_handle->stream_list));
-	/* handle should record which enc_grp its belong to */
-	enc_handle->grp_type = type; //record group type
-	add_user(enc_handle);
-	ret_handle = enc_handle;
+open_input.AkvParams.EncFrameRate =
+    param->fps > 0 ? param->fps : 25;
 
-	venc_sysipc_bind_chn_handle(enc_handle, type);
+open_input.AkvParams.TargetBitRate =
+    param->bps > 0 ? param->bps : 2048;
+open_input.AkvParams.MaxBitRate =
+    open_input.AkvParams.TargetBitRate;
 
-	ak_print_normal_ex(MPI_VENC "allocating type=%d, enc_handle: %p\n\n",
-			type, enc_handle);
+/* STEP 4: HARD rules for AKV stability */
+open_input.AkvParams.GopLength = 50;
+open_input.AkvParams.GopNumB   = 0;
+open_input.AkvParams.NumSlices = 1;
+
+/* Disable ALL smart / LT logic */
+open_input.AkvParams.SmartMode         = 0;
+open_input.AkvParams.SmartGopLength   = 0;
+open_input.AkvParams.SmartQuality     = 0;
+open_input.AkvParams.SmartStaticValue = 0;
+
+/* QP range */
+open_input.AkvParams.MinQP = 28;
+open_input.AkvParams.MaxQP = 48;
+open_input.AkvParams.InitialSliceQP = 38;
+
+/* Profile & RC */
+open_input.AkvParams.eProfile = AK_PROFILE_AVC_MAIN;
+open_input.AkvParams.eRCMode  = AK_RC_CBR;
+
+ak_print_error_ex(
+    "AKV FINAL: %dx%d slices=%d qp=%d-%d initqp=%d gop=%d fps=%d\n",
+    open_input.AkvParams.FrameWidth,
+    open_input.AkvParams.FrameHeight,
+    open_input.AkvParams.NumSlices,
+    open_input.AkvParams.MinQP,
+    open_input.AkvParams.MaxQP,
+    open_input.AkvParams.InitialSliceQP,
+    open_input.AkvParams.GopLength,
+    open_input.AkvParams.EncFrameRate
+);
+if (param->width == 0 || param->height == 0) {
+    ak_print_error(
+        "VENC: invalid resolution %dx%d, delay open (grp=%d)\n",
+        param->width, param->height, param->enc_grp
+    );
+    set_error_no(ERROR_TYPE_INVALID_ARG);
+    goto venc_open_end;
+}
+
+
+    enc_handle->lib_handle = AKV_Encoder_Open(&open_input);
+    if (!enc_handle->lib_handle) {
+        free(enc_handle->encbuf);
+        enc_handle->encbuf = NULL;
+        set_error_no(ERROR_TYPE_MEDIA_LIB_FAILED);
+        goto venc_open_end;
+    }
+
+    enc_handle->grp_type = type;
+    INIT_LIST_HEAD(&enc_handle->stream_list);
+    add_user(enc_handle);
+    ret_handle = enc_handle;
 
 venc_open_end:
-	ak_thread_mutex_unlock(&enc_handle->lock);
-	ak_thread_mutex_unlock(&close_lock);
-	return ret_handle;
+    ak_thread_mutex_unlock(&enc_handle->lock);
+    ak_thread_mutex_unlock(&close_lock);
+    return ret_handle;
 }
+
 
 /*
  * ak_venc_send_frame - encode single frame
@@ -2764,6 +2774,7 @@ int ak_venc_close(void *enc_handle)
  * return: on success return stream_handle, failed return NULL
  * notes:
  */
+ #if 0
 void *ak_venc_request_stream(void *vi_handle, void *enc_handle)
 {
 	if (!enc_handle || !vi_handle) {
@@ -2772,6 +2783,27 @@ void *ak_venc_request_stream(void *vi_handle, void *enc_handle)
 		set_error_no(ERROR_TYPE_POINTER_NULL);
 		return NULL;
 	}
+#endif
+void *ak_venc_request_stream(void *vi_handle, void *enc_handle)
+{
+    if (!enc_handle || !vi_handle) {
+        // Enhanced debugging
+        if (!vi_handle) {
+            ak_print_error_ex(MPI_VENC "vi_handle is NULL. Ensure the video input device is initialized.\n");
+        }
+        if (!enc_handle) {
+            ak_print_error_ex(MPI_VENC "enc_handle is NULL. ak_venc_open must be called before this.\n");
+        }
+
+        // Retain the existing error message
+        ak_print_error_ex(MPI_VENC "uninit handle! vi_handle=%p, enc_handle=%p\n",
+            vi_handle, enc_handle);
+
+        // Set the error number and return NULL
+        set_error_no(ERROR_TYPE_POINTER_NULL);
+        return NULL;
+    }
+
 
 	struct stream_handle *new_handle = (struct stream_handle *)calloc(1,
 			sizeof(struct stream_handle));
