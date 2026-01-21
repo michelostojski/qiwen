@@ -22,6 +22,16 @@
 #define LEN_IFACE 32
 #define LEN_IP    32
 #define LEN_LINK  128
+AK_int ak_rtsp_stop(AK_int index)
+{
+    (void)index;  /* index unused, silence warnings */
+
+    ak_print_notice("ak_rtsp_stop() called\n");
+
+    ak_rtsp_exit();   /* safe full cleanup */
+
+    return AK_SUCCESS;
+}
 
 
 /**
@@ -234,8 +244,11 @@ static AK_void _buffer_venc (AK_Thread th, AK_int argc, AK_voidptr argv[]) {
 
 	/* venc open for sub net */
 	ak_venc = video_encode_init (ch);
-	AK_ASSERT (NULL != ak_venc);
-
+	//AK_ASSERT (NULL != ak_venc);
+if (!ak_vstream) {
+    ak_print_error("venc stream create failed, exit thread\n");
+    goto venc_exit;
+}
 	rtsp_venc_set_bps (ak_venc, &_rtsp_ctrl_param.rtsp_chn[ch]);
 
 	/* venc request */
@@ -267,6 +280,7 @@ static AK_void _buffer_venc (AK_Thread th, AK_int argc, AK_voidptr argv[]) {
 
 
 
+
 /**
  * ak_rtsp_init - init rtsp param
  *                start rtsp dispense sever
@@ -275,87 +289,115 @@ static AK_void _buffer_venc (AK_Thread th, AK_int argc, AK_voidptr argv[]) {
  */
 int ak_rtsp_init(struct rtsp_param *param)
 {
-    char ac_iface[LEN_IFACE], ac_ip[LEN_IP], ac_rtsp[LEN_LINK];
-    AK_int argc = 0;
-    AK_voidptr argv[32];
-    AK_int i = 0;
-    AK_int registry = 0;
-    AK_int port = 554;
+	char ac_iface[LEN_IFACE], ac_ip[LEN_IP], ac_rtsp[LEN_LINK];
+	AK_int argc = 0;
+	AK_voidptr argv[32];
+	AK_int i = 0;
+	AK_int registry = 0;
+	AK_int port = 554;
 
-    //AK_EXPECT_RETURN_VAL(AK_null == _Heap, AK_FAILED);
-     if (_Heap != AK_null) {
-    ak_print_notice("RTSP already initialized, skipping\n");
-    return 0;
-}
-if (registry <= 0) {
-    ak_print_error_ex("RTSP register url failed\n");
-    ak_rtsp_exit();   // <-- IMPORTANT
-    return -1;
-}
+	AK_EXPECT_RETURN_VAL (AK_null == _Heap, AK_FAILED);
 
-    if (!param) {
-        ak_print_error_ex("invalid argument\n");
+	if (!param) {
+		ak_print_error_ex("invalid argument\n");
+		return -1;
+	}
+/* ---- EARLY VALIDATION: MUST be before Heap/Server creation ---- */
+for (i = 0; i < RTSP_CHANNEL_NUM; i++) {
+    if (param->rtsp_chn[i].suffix_name[0] == '\0') {
+        ak_print_error_ex("RTSP init: ch=%d empty suffix\n", i);
         return -1;
     }
 
-    /* ===================== DEFENSIVE CHECK (HERE) ===================== */
-    for (i = 0; i < RTSP_CHANNEL_NUM; i++) {
-        if (param->rtsp_chn[i].width == 0 ||
-            param->rtsp_chn[i].height == 0) {
-
-            ak_print_error_ex(
-                "RTSP init too early: ch=%d invalid resolution %dx%d\n",
-                i,
-                param->rtsp_chn[i].width,
-                param->rtsp_chn[i].height
-            );
-            return -1;
-        }
-
-        if (!param->rtsp_chn[i].vi_handle) {
-            ak_print_error_ex(
-                "RTSP init too early: ch=%d vi_handle is NULL\n", i
-            );
-            return -1;
-        }
+    if (param->rtsp_chn[i].width == 0 || param->rtsp_chn[i].height == 0) {
+        ak_print_error_ex(
+            "RTSP init too early: ch=%d invalid resolution %ux%u\n",
+            i,
+            param->rtsp_chn[i].width,
+            param->rtsp_chn[i].height
+        );
+        return -1;
     }
-    /* ================================================================ */
 
+    if (param->rtsp_chn[i].vi_handle == NULL) {
+        ak_print_error_ex("RTSP init: ch=%d vi_handle NULL\n", i);
+        return -1;
+    }
+}
+	/// 初始化栈分配器
+_Heap = akae_malloc_create(AK_true, _heap, sizeof(_heap));
+if (_Heap == AK_null) {
+    ak_print_error_ex("RTSP: heap create failed\n");
+    return -1;
+}
 
-	/// 初始化栈分配器。
-	_Heap = akae_malloc_create (AK_true, _heap, sizeof (_heap));
-	AK_EXPECT_RETURN_VAL (AK_null != _Heap, AK_FAILED);
+memcpy(&_rtsp_ctrl_param, param, sizeof(_rtsp_ctrl_param));
 
-	memcpy(&_rtsp_ctrl_param, param, sizeof(_rtsp_ctrl_param));
-	
-	_Server = akae_rtsp_server_create (_Heap);
-	AK_ASSERT (AK_null != _Server);
-	akae_rtsp_server_verbose (_Server, AK_true);
-	akae_rtsp_server_verbose_http (_Server, AK_true);
+_Server = akae_rtsp_server_create(_Heap);
+if (_Server == AK_null) {
+    ak_print_error_ex("RTSP: server create failed\n");
+    goto fail;
+}
 
-	/// 创建音频缓冲。
-	_711aStreamQ = akae_rtp_queue_create (_Heap, AK_RTP_PT_PCMA);
-	AK_ASSERT (AK_null != _711aStreamQ);
-	_AStreamTH = akae_thread_create_default (_buffer_aenc);
-	AK_ASSERT (_AStreamTH> 0);
+akae_rtsp_server_verbose(_Server, AK_true);
+akae_rtsp_server_verbose_http(_Server, AK_true);
 
-	for (i = 0; i < RTSP_CHANNEL_NUM; ++i) {
+/// 创建音频缓冲
+_711aStreamQ = akae_rtp_queue_create(_Heap, AK_RTP_PT_PCMA);
+if (_711aStreamQ == AK_null) {
+    ak_print_error_ex("RTSP: audio queue create failed\n");
+    goto fail;
+}
 
-		_VStreamQ[i] =  akae_rtp_queue_create (_Heap, HEVC_ENC_TYPE == param->rtsp_chn[i].video_enc_type ? AK_RTP_PT_H265 : AK_RTP_PT_H264);
-		AK_ASSERT (AK_null != _VStreamQ[i]);
+_AStreamTH = akae_thread_create_default(_buffer_aenc);
+if (_AStreamTH <= 0) {
+    ak_print_error_ex("RTSP: audio thread create failed\n");
+    goto fail;
+}
 
-		/// 注册监听地址。
-		registry = akae_rtsp_server_register_url (_Server, param->rtsp_chn[i].suffix_name, AK_null, AK_null);
-		AK_ASSERT (registry > 0);
-		akae_rtsp_server_describe_video (_Server, registry, akae_rtp_queue_payload_type (_VStreamQ[i]), 90000, _VStreamQ[i]);
-		akae_rtsp_server_describe_g711a (_Server, registry, _711aStreamQ);
+for (i = 0; i < RTSP_CHANNEL_NUM; ++i) {
+
+    _VStreamQ[i] = akae_rtp_queue_create(
+        _Heap,
+        HEVC_ENC_TYPE == param->rtsp_chn[i].video_enc_type
+            ? AK_RTP_PT_H265
+            : AK_RTP_PT_H264
+    );
+    if (_VStreamQ[i] == AK_null) {
+        ak_print_error_ex("RTSP: video queue failed ch=%d\n", i);
+        goto fail;
+    }
+
+    /// 注册监听地址
+    registry = akae_rtsp_server_register_url(
+        _Server,
+        param->rtsp_chn[i].suffix_name,
+        AK_null,
+        AK_null
+    );
+    if (registry <= 0) {
+        ak_print_error_ex(
+            "RTSP register url failed ch=%d suffix=%s\n",
+            i,
+            param->rtsp_chn[i].suffix_name
+        );
+        goto fail;
+    }
+
+    akae_rtsp_server_describe_video(
+        _Server,
+        registry,
+        akae_rtp_queue_payload_type(_VStreamQ[i]),
+        90000,
+        _VStreamQ[i]
+    );
+
+    akae_rtsp_server_describe_g711a(_Server, registry, _711aStreamQ);
 
 
 		/// 创建后台线程缓冲编码数据。
 		argc = 0;
-		argv[argc++] = (AK_voidptr)(intptr_t)i;
-
-
+		argv[argc++] = (AK_voidptr)(i);
 		_VStreamTH[i] = akae_thread_create_default2 (_buffer_venc, argc, argv);
 		AK_ASSERT (_VStreamTH[i] > 0);
 
@@ -377,9 +419,8 @@ if (registry <= 0) {
 	COLOR_PRINT( COLOR_MODE_BOLD, COLOR_BACK_BLACK, COLOR_FRONT_GREEN, ac_rtsp, LEN_LINK, "***********************************************\n" )
 
 	return 0;
+	
 }
-
-
 
 /**
  * @deprecated >= 1.9.00
@@ -388,12 +429,6 @@ int ak_rtsp_start(int index) {
 	return 0;
 }
 
-/**
- * @deprecated >= 1.9.00
- */
-int ak_rtsp_stop(int index) {
-	return 0;
-}
 
 /**
  * ak_rtsp_exit - exit rtsp
