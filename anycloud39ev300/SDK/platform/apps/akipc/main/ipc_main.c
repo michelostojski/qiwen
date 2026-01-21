@@ -12,6 +12,7 @@
 #include <syslog.h>
 #include <ctype.h>
 #include <math.h>
+#include <net/if.h>
 
 #include "monitor.h"
 
@@ -39,14 +40,44 @@
 #include "record_ctrl.h"
 #include "ak_config.h"
 
+#include <limits.h>
+
+
 /* anyka_ipc platform version */
 #define AK_VERSION_SOFTWARE             "V1.0.47"
 
 /* ISP config file path */
-#define FIRST_PATH       				"/etc/jffs2/"
-#define BACK_PATH        				"/usr/local/"
+#define FIRST_PATH       				"/mnt/jffs2/"
+#define BACK_PATH        				"/mnt/jffs2/local/"
 
 #define IPC_AI_MAX_VOLUME				8
+
+
+//#include <ak_mem_dma.h>
+static void ipc_video_mem_init(void)
+{
+#ifdef HAVE_AK_MEM_DMA
+    int ret = ak_mem_dma_pool_activate();
+    if (ret != 0)
+        printf("DMA pool activate failed: %d\n", ret);
+#else
+    /* DMA pool not available */
+#endif
+}
+
+#if 0
+static void ipc_video_mem_init(void)
+{
+    int ret = ak_mem_dma_pool_activate();
+    if (ret != 0) {
+        printf("DMA pool activate failed: %d\n", ret);
+    } else {
+        printf("DMA pool activated successfully\n");
+    }
+}
+#endif
+//static void ipc_video_mem_init(void); 
+//ipc_video_mem_init();
 
 /* make sure vi, ai and ao open just once */
 static void *vi_handle = NULL;
@@ -188,41 +219,33 @@ static int init_vi(void)
 		camera->main_max_height = resolution.height;
 	}
 	
-	memset(&attr, 0x00, sizeof(attr));
-	attr.res[VIDEO_CHN_MAIN].width = camera->main_width;
-	attr.res[VIDEO_CHN_MAIN].height = camera->main_height;
-	attr.res[VIDEO_CHN_SUB].width = camera->sub_width;
-	attr.res[VIDEO_CHN_SUB].height = camera->sub_height;
-	attr.res[VIDEO_CHN_MAIN].max_width = camera->main_max_width;
-	attr.res[VIDEO_CHN_MAIN].max_height = camera->main_max_height;
-	attr.res[VIDEO_CHN_SUB].max_width = camera->sub_max_width;
-	attr.res[VIDEO_CHN_SUB].max_height = camera->sub_max_height;
-	attr.crop.left = 0;
-	attr.crop.top = 0;
-	attr.crop.width = resolution.width;
-	attr.crop.height = resolution.height;
+memset(&attr, 0x00, sizeof(attr));
 
-	if (ak_vi_set_channel_attr(vi_handle, &attr)) {
-		ak_print_error_ex("set channel attribute failed\n");
-	}
+/* MAIN channel: MUST be full sensor */
+attr.res[VIDEO_CHN_MAIN].width      = resolution.width;
+attr.res[VIDEO_CHN_MAIN].height     = resolution.height;
+attr.res[VIDEO_CHN_MAIN].max_width  = resolution.width;
+attr.res[VIDEO_CHN_MAIN].max_height = resolution.height;
 
-	/* get crop */
-	struct video_channel_attr cur_attr;
+/* SUB channel: can be scaled */
+attr.res[VIDEO_CHN_SUB].width      = camera->sub_width;
+attr.res[VIDEO_CHN_SUB].height     = camera->sub_height;
+attr.res[VIDEO_CHN_SUB].max_width  = camera->sub_max_width;
+attr.res[VIDEO_CHN_SUB].max_height = camera->sub_max_height;
 
-	memset(&cur_attr, 0x00, sizeof(cur_attr));
-	if (ak_vi_get_channel_attr(vi_handle, &cur_attr)) {
-		ak_print_normal("ak_vi_get_channel_attr failed!\n");
-	}
+/* Crop MUST be full sensor */
+attr.crop.left   = 0;
+attr.crop.top    = 0;
+attr.crop.width  = resolution.width;
+attr.crop.height = resolution.height;
 
-	ak_print_normal_ex("capture fps: %d\n", ak_vi_get_fps(vi_handle));
-	ak_print_normal("\nvideo input info:\n"
-			"\tmain_w[%d], main_h[%d], sub_w[%d], sub_h[%d]\n\n",
-			camera->main_width, camera->main_height,
-			camera->sub_width, camera->sub_height);
-
-	return AK_SUCCESS;
+if (ak_vi_set_channel_attr(vi_handle, &attr)) {
+    ak_print_error_ex("set channel attribute failed\n");
+    return AK_FAILED;
 }
-
+/* success */
+return AK_SUCCESS;
+}
 /* match sensor according to ISP config file path */
 static int match_sensor(const char *isp_cfg_path)
 {
@@ -233,7 +256,7 @@ static int match_sensor(const char *isp_cfg_path)
 	}
 
 	int ret = AK_FAILED;
-	char isp_file[255] = {0};
+	char isp_file[PATH_MAX] = {0};
 	char *tmp = NULL;
 	char *isp_cfg = NULL;
 	struct dirent *dir_ent = NULL;
@@ -284,20 +307,20 @@ static int match_sensor(const char *isp_cfg_path)
 			continue;
 		}
 
-		sprintf(isp_file, "%s%s", isp_cfg_path, dir_ent->d_name);
+		snprintf(isp_file, sizeof(isp_file), "%s%s", isp_cfg_path, dir_ent->d_name);
 		/* get sensor id, match config file */
 		if(AK_SUCCESS == ak_vi_match_sensor(isp_file)) {
 			ak_print_notice_ex("ak_vi_match_sensor OK\n");
 			ret = AK_SUCCESS;
 
 			if (strcmp(isp_cfg_path, FIRST_PATH)) {
-				char cmd[128] = {0};
+				char cmd[PATH_MAX] = {0};
 				char result[2] = {0};
 
-				sprintf(cmd, "cp %s %s", isp_file, FIRST_PATH);
+				snprintf(cmd, sizeof(cmd), "cp %s %s", isp_file, FIRST_PATH);
 				ak_cmd_exec(cmd, result, 2);
 
-				sprintf(isp_file, "%s%s", FIRST_PATH, dir_ent->d_name);
+				snprintf(isp_file, sizeof(isp_file), "%s%s", FIRST_PATH, dir_ent->d_name);
 				ak_vi_match_sensor(isp_file);
 			}
 			break;
@@ -344,179 +367,138 @@ static int init_video(void)
 
 static int init_ai(void)
 {
-	struct pcm_param ai_param = {0};
+    struct pcm_param ai_param = {0};
 
-	/* set correct param to open audio input */
-	ai_param.sample_bits = 16;
-	/* channel number only support AUDIO_CHANNEL_MONO */
-	ai_param.channel_num = AUDIO_CHANNEL_MONO;
+    ai_param.sample_bits = 16;
+    ai_param.channel_num = AUDIO_CHANNEL_MONO;
 
-	struct video_record_config *record_config = ak_config_get_record();
-	ai_param.sample_rate = record_config->sample_rate;
+    struct video_record_config *record_config = ak_config_get_record();
 
-	ai_handle = ak_ai_open(&ai_param);
-	if(NULL == ai_handle){
-		return AK_FAILED;
-	}
+    /* FIX: validate sample rate */
+    if (!record_config || record_config->sample_rate == 0) {
+        ak_print_notice_ex("audio sample_rate invalid, fallback to 8000\n");
+        ai_param.sample_rate = 8000;
+    } else {
+        ai_param.sample_rate = record_config->sample_rate;
+    }
 
-	/* set ai attributions after open OK */
-	ak_ai_set_aec(ai_handle, AUDIO_FUNC_ENABLE);
-	ak_ai_set_nr_agc(ai_handle, AUDIO_FUNC_ENABLE);
-	ak_ai_set_resample(ai_handle, AUDIO_FUNC_DISABLE);
-	ak_ai_set_volume(ai_handle, IPC_AI_MAX_VOLUME);
-	if (AK_SUCCESS == ak_ai_set_frame_interval(ai_handle, AUDIO_DEFAULT_INTERVAL)) {
-		ak_print_normal_ex("ai frame interval=%d\n", AUDIO_DEFAULT_INTERVAL);
-	}
+    ai_handle = ak_ai_open(&ai_param);
+    if (!ai_handle) {
+        ak_print_error_ex("ak_ai_open failed (rate=%d)\n",
+                          ai_param.sample_rate);
+        return AK_FAILED;
+    }
 
-	struct audio_config *audio_config = ak_config_get_audio();
-	ak_ai_set_source(ai_handle, audio_config->ai_source);
-	ak_ai_clear_frame_buffer(ai_handle);
+    ak_ai_set_aec(ai_handle, AUDIO_FUNC_ENABLE);
+    ak_ai_set_nr_agc(ai_handle, AUDIO_FUNC_ENABLE);
+    ak_ai_set_resample(ai_handle, AUDIO_FUNC_DISABLE);
+    ak_ai_set_volume(ai_handle, IPC_AI_MAX_VOLUME);
 
-	return AK_SUCCESS;
-}
+    if (AK_SUCCESS == ak_ai_set_frame_interval(ai_handle,
+                                               AUDIO_DEFAULT_INTERVAL)) {
+        ak_print_normal_ex("ai frame interval=%d\n",
+                           AUDIO_DEFAULT_INTERVAL);
+    }
 
-static int init_ao(void)
-{
-	struct pcm_param ao_param = {0};
-	ao_param.sample_bits = 16;
-	/* driver always set to AUDIO_CHANNEL_STEREO, so you don't care */
-	ao_param.channel_num = AUDIO_CHANNEL_MONO;
-	ao_param.sample_rate = 8000;
+    struct audio_config *audio_config = ak_config_get_audio();
+    if (audio_config) {
+        ak_ai_set_source(ai_handle, audio_config->ai_source);
+    }
 
-	ao_handle = ak_ao_open(&ao_param);
-	if(NULL == ao_handle) {
-		return AK_FAILED;
-	}
-
-	/* set ao attributions after open OK */
-	ak_ao_enable_speaker(ao_handle, AUDIO_FUNC_ENABLE);
-	ak_ao_set_volume(ao_handle, 6);
-	ak_ao_set_resample(ao_handle, AUDIO_FUNC_DISABLE);
-	ak_ao_clear_frame_buffer(ao_handle);
-
-	return AK_SUCCESS;
+    ak_ai_clear_frame_buffer(ai_handle);
+    return AK_SUCCESS;
 }
 
 static int init_audio(void)
 {
-	if (AK_FAILED == init_ai()) {
-		ak_print_error_ex("init ai failed\n");
-		return AK_FAILED;
-	}
-	ak_print_notice_ex("init audio in OK\n");
+    if (AK_FAILED == init_ai()) {
+        ak_print_error_ex("init ai failed\n");
+        return AK_FAILED;
+    }
 
-	int ret = init_ao();
-	if (AK_FAILED == ret) {
-		ak_print_error_ex("init ao failed\n");
-	}
-	ak_print_notice_ex("init audio out OK\n");
+    ak_print_notice_ex("init audio in OK\n");
 
-	return ret;
+    /* AO not supported on this platform */
+    ak_print_notice_ex("init audio out skipped\n");
+
+    return AK_SUCCESS;
 }
 
 #ifdef CONFIG_RTSP_SUPPORT
 static void init_rtsp(void)
 {
-	struct rtsp_param param = {{{0}}};
-	struct camera_disp_config *camera = ak_config_get_camera_info();
-	struct video_config *video = ak_config_get_sys_video();
+    struct rtsp_param param;
+    struct video_channel_attr vi_attr;
+    struct video_config *video;
 
-	/* main channel config */
-	param.rtsp_chn[0].current_channel = 0;
-	param.rtsp_chn[0].width 	= camera->main_width;
-	param.rtsp_chn[0].height 	= camera->main_height;
+    memset(&param, 0, sizeof(param));
+    memset(&vi_attr, 0, sizeof(vi_attr));
 
-	param.rtsp_chn[0].fps 	 	= video->main_fps;
-	param.rtsp_chn[0].max_kbps 	= video->main_max_kbps;
-	param.rtsp_chn[0].min_qp	= video->main_min_qp;
-	param.rtsp_chn[0].max_qp 	= video->main_max_qp;
-	param.rtsp_chn[0].gop_len	= video->main_gop_len;
+    if (!vi_handle) {
+        ak_print_error("RTSP init aborted: vi_handle NULL\n");
+        return;
+    }
 
-	param.rtsp_chn[0].video_enc_type = video->main_enc_type;
-	param.rtsp_chn[0].video_br_mode  = video->main_video_mode;
+    if (ak_vi_get_channel_attr(vi_handle, &vi_attr) != 0) {
+        ak_print_error("RTSP: get channel attr failed\n");
+        return;
+    }
 
-	param.rtsp_chn[0].vi_handle = vi_handle;
-	strcpy(param.rtsp_chn[0].suffix_name, "vs0");
+    /* camera not ready yet */
+    if (vi_attr.res[0].width == 0 || vi_attr.res[0].height == 0) {
+        ak_print_notice(
+            "RTSP waiting for camera... main=%ux%u\n",
+            vi_attr.res[0].width,
+            vi_attr.res[0].height
+        );
+        return;
+    }
 
-	/* next param, VBR only */
-	if (param.rtsp_chn[0].video_br_mode == BR_MODE_VBR) {
-		/* smart model */
-		if (video->main_smart_mode == 1 || video->main_smart_mode == 2) {
-			param.rtsp_chn[0].smart.smart_mode 	= video->main_smart_mode;
-			param.rtsp_chn[0].smart.smart_goplen = video->main_smart_goplen;
-			param.rtsp_chn[0].smart.smart_static_value = video->main_smart_static_value;
+    video = ak_config_get_sys_video();
+    if (!video) {
+        ak_print_error("RTSP init aborted: video config NULL\n");
+        return;
+    }
 
-			/* H.265 */
-			if (param.rtsp_chn[0].video_enc_type == HEVC_ENC_TYPE) {
-				param.rtsp_chn[0].smart.smart_quality = video->main_smart_quality_265;
-				param.rtsp_chn[0].target_ratio = video->main_smart_target_ratio_265;
-				ak_print_notice_ex("normal vbr 265, rario:%d\n", param.rtsp_chn[0].target_ratio);
-			} else if (param.rtsp_chn[0].video_enc_type == H264_ENC_TYPE) {	/* H.264 */
-				param.rtsp_chn[0].smart.smart_quality = video->main_smart_quality_264;
-				param.rtsp_chn[0].target_ratio = video->main_smart_target_ratio_264;
-				ak_print_notice_ex("normal vbr 264, rario:%d\n", param.rtsp_chn[0].target_ratio);
-			}
-		} else {	/* normal vbr model */
-			if (param.rtsp_chn[0].video_enc_type == HEVC_ENC_TYPE) {
-				param.rtsp_chn[0].target_ratio = video->main_target_ratio_265;
-			} else if (param.rtsp_chn[0].video_enc_type == H264_ENC_TYPE) {
-				param.rtsp_chn[0].target_ratio = video->main_target_ratio_264;
-			}
-		}
-	}
+    /* ===== main channel ===== */
+    param.rtsp_chn[0].current_channel = 0;
+    param.rtsp_chn[0].width  = vi_attr.res[0].width;
+    param.rtsp_chn[0].height = vi_attr.res[0].height;
+    param.rtsp_chn[0].fps    = video->main_fps;
+    param.rtsp_chn[0].max_kbps = video->main_max_kbps;
+    param.rtsp_chn[0].min_qp = video->main_min_qp;
+    param.rtsp_chn[0].max_qp = video->main_max_qp;
+    param.rtsp_chn[0].gop_len = video->main_gop_len;
+    param.rtsp_chn[0].video_enc_type = video->main_enc_type;
+    param.rtsp_chn[0].video_br_mode  = video->main_video_mode;
+    param.rtsp_chn[0].vi_handle = vi_handle;
+    strcpy(param.rtsp_chn[0].suffix_name, "vs0");
 
-	/* main channel config */
-	param.rtsp_chn[1].current_channel = 1;
-	param.rtsp_chn[1].width 	= camera->sub_width;
-	param.rtsp_chn[1].height 	= camera->sub_height;
+    /* ===== sub channel ===== */
+    param.rtsp_chn[1].current_channel = 1;
+    param.rtsp_chn[1].width  = vi_attr.res[1].width;
+    param.rtsp_chn[1].height = vi_attr.res[1].height;
+    param.rtsp_chn[1].fps    = video->sub_fps;
+    param.rtsp_chn[1].max_kbps = video->sub_max_kbps;
+    param.rtsp_chn[1].min_qp = video->sub_min_qp;
+    param.rtsp_chn[1].max_qp = video->sub_max_qp;
+    param.rtsp_chn[1].gop_len = video->sub_gop_len;
+    param.rtsp_chn[1].video_enc_type = video->sub_enc_type;
+    param.rtsp_chn[1].video_br_mode  = video->sub_video_mode;
+    param.rtsp_chn[1].vi_handle = vi_handle;
+    strcpy(param.rtsp_chn[1].suffix_name, "vs1");
 
-	param.rtsp_chn[1].fps 	 	= video->sub_fps;
-	param.rtsp_chn[1].max_kbps 	= video->sub_max_kbps;
-	param.rtsp_chn[1].min_qp	= video->sub_min_qp;
-	param.rtsp_chn[1].max_qp 	= video->sub_max_qp;
-	param.rtsp_chn[1].gop_len	= video->sub_gop_len;
+    ak_print_notice(">>> CALLING ak_rtsp_init <<<\n");
 
-	param.rtsp_chn[1].video_enc_type = video->sub_enc_type;
-	param.rtsp_chn[1].video_br_mode  = video->sub_video_mode;
-
-	param.rtsp_chn[1].vi_handle = vi_handle;
-	strcpy(param.rtsp_chn[1].suffix_name, "vs1");
-
-	/* next param, VBR only */
-	if (param.rtsp_chn[1].video_br_mode == BR_MODE_VBR) {
-		/* smart model */
-		if (video->sub_smart_mode == 1 || video->sub_smart_mode == 2) {
-			param.rtsp_chn[1].smart.smart_mode 	= video->sub_smart_mode;
-			param.rtsp_chn[1].smart.smart_goplen = video->sub_smart_goplen;
-			param.rtsp_chn[1].smart.smart_static_value = video->sub_smart_static_value;
-
-			/* H.265 */
-			if (param.rtsp_chn[1].video_enc_type == HEVC_ENC_TYPE) {
-				param.rtsp_chn[1].smart.smart_quality = video->sub_smart_quality_265;
-				param.rtsp_chn[1].target_ratio = video->sub_smart_target_ratio_265;
-			} else if (param.rtsp_chn[1].video_enc_type == H264_ENC_TYPE) {	/* H.264 */
-				param.rtsp_chn[1].smart.smart_quality = video->sub_smart_quality_264;
-				param.rtsp_chn[1].target_ratio = video->sub_smart_target_ratio_264;
-			}
-		} else {	/* normal vbr model */
-			if (param.rtsp_chn[1].video_enc_type == HEVC_ENC_TYPE) {
-				param.rtsp_chn[1].target_ratio = video->sub_target_ratio_265;
-			} else if (param.rtsp_chn[1].video_enc_type == H264_ENC_TYPE) {
-				param.rtsp_chn[1].target_ratio = video->sub_target_ratio_264;
-			}
-		}
-	}
-
-	ak_print_notice_ex("rtsp version: %s\n", ak_rtsp_get_version());
-	if (ak_rtsp_init(&param)){
-		ak_print_error_ex("######## rtsp init failed ########\n");
-	} else {
-		ak_rtsp_start(0);
-		ak_rtsp_start(1);
-	    ak_print_normal("start rtsp OK\n");
-	}
+    if (ak_rtsp_init(&param) != 0) {
+        ak_print_error("RTSP init failed\n");
+    } else {
+        ak_print_notice("RTSP init OK\n");
+    }
 }
 #endif
+
+
 
 static void init_record_file(enum dvr_file_type file_type)
 {
@@ -607,7 +589,7 @@ static void init_other_platform(void)
 	/* decide what cloud we configured support */
 #ifdef CONFIG_RTSP_SUPPORT
 	if(cloud->rtsp) {
-	    init_rtsp();
+	   // init_rtsp();
 	}
 #endif
 
@@ -623,63 +605,105 @@ static void init_other_platform(void)
 #endif
 
 }
-
 static int init_software(void)
 {
-	/* init ipc_srv */
-	ak_cmd_server_register(ANYKA_IPC_PORT, "anyka_ipc7000");
+    int ret = AK_FAILED;
 
-	/** load config message, than init it **/
-	ak_config_init_ini();
+    /* command server FIRST */
+    ak_cmd_server_register(ANYKA_IPC_PORT, "anyka_ipc7000");
 
-	/* just let we know what interface we use now */
-	ak_net_get_cur_iface(NULL);
+    /* load configuration */
+    ak_config_init_ini();
 
-	int ret = AK_FAILED;
-	if(AK_FAILED == init_video()) {
-		goto software_end;
-	}
+    /* ================================================= */
+    /* HAL VIDEO MUST BE FIRST                           */
+    /* ================================================= */
+    ak_print_notice("hal_video_init (EARLY)\n");
+   // if (hal_video_init() != 0) {
+       // ak_print_error("hal_video_init failed\n");
+     //   goto software_end;
+    //}
 
-	if(AK_FAILED == init_audio()) {
-		goto software_end;
-	}
-	/* resiger misc sys-ipc msg */
-	ak_misc_sys_ipc_register();
+    /* ================================================= */
+    /* VIDEO INPUT (VI)                                  */
+    /* ================================================= */
+    if (AK_FAILED == init_video()) {
+        ak_print_error("init_video failed\n");
+        goto software_end;
+    }
 
-	ak_drv_ir_init();
-	/* init voice play module */
-	ak_misc_init_voice_tips(ao_handle);
+#ifdef CONFIG_RTSP_SUPPORT
+    struct rtsp_param param;
+    memset(&param, 0, sizeof(param));
 
-	if (ak_misc_ipc_first_run()) {
-		struct audio_param file_param = {AK_AUDIO_TYPE_MP3, 8000, 16, 1};
-		ak_misc_add_voice_tips("/usr/share/anyka_camera_start.mp3", &file_param);
-	}
+    struct camera_disp_config *camera = ak_config_get_camera_info();
+    struct video_config *video = ak_config_get_sys_video();
 
-	init_other_platform();
+    /* MAIN */
+    param.rtsp_chn[0].current_channel = 0;
+    param.rtsp_chn[0].width  = camera->main_width;
+    param.rtsp_chn[0].height = camera->main_height;
+    param.rtsp_chn[0].fps    = video->main_fps;
+    param.rtsp_chn[0].video_enc_type = video->main_enc_type;
+    param.rtsp_chn[0].video_br_mode  = video->main_video_mode;
+    param.rtsp_chn[0].vi_handle = vi_handle;
+    strcpy(param.rtsp_chn[0].suffix_name, "vs0");
 
-	ret = AK_SUCCESS;
+    /* SUB */
+    param.rtsp_chn[1].current_channel = 1;
+    param.rtsp_chn[1].width  = camera->sub_width;
+    param.rtsp_chn[1].height = camera->sub_height;
+    param.rtsp_chn[1].fps    = video->sub_fps;
+    param.rtsp_chn[1].video_enc_type = video->sub_enc_type;
+    param.rtsp_chn[1].video_br_mode  = video->sub_video_mode;
+    param.rtsp_chn[1].vi_handle = vi_handle;
+    strcpy(param.rtsp_chn[1].suffix_name, "vs1");
+
+    ak_print_notice(">>> CALLING ak_rtsp_init <<<\n");
+    if (ak_rtsp_init(&param) != 0) {
+        ak_print_error("RTSP init failed\n");
+        goto software_end;
+    }
+
+    ak_rtsp_start(0);
+    ak_rtsp_start(1);
+
+    ak_print_notice("RTSP started successfully\n");
+#endif
+
+    /* ================================================= */
+    /* AUDIO (AFTER VIDEO + RTSP)                        */
+    /* ================================================= */
+    if (AK_FAILED == init_audio()) {
+        ak_print_error("init_audio failed\n");
+        goto software_end;
+    }
+
+    ak_misc_sys_ipc_register();
+    ak_drv_ir_init();
+
+    if (ao_handle) {
+        ak_misc_init_voice_tips(ao_handle);
+    }
+
+    init_other_platform();
+
+    ret = AK_SUCCESS;
 
 software_end:
-	if (AK_FAILED == ret) {
-		ak_vpss_destroy(VIDEO_DEV0);
-		if (vi_handle) {
-			ak_vi_close(vi_handle);
-			vi_handle = NULL;
-		}
-		if (ai_handle) {
-			ak_ai_close(ai_handle);
-			ai_handle = NULL;
-		}
-		if (ao_handle) {
-			ak_ao_close(ao_handle);
-			ao_handle = NULL;
-		}
-	}
+    if (AK_FAILED == ret) {
+        if (vi_handle) ak_vi_close(vi_handle);
+        if (ai_handle) ak_ai_close(ai_handle);
+        if (ao_handle) ak_ao_close(ao_handle);
+    }
 
-	return ret;
+    return ret;
 }
 
-static void process_signal(unsigned int sig, siginfo_t *si, void *ptr)
+
+
+
+static void process_signal(int sig, siginfo_t *si, void *ptr)
 {
 	if(ipc_run_flag) {
 		char res[2] = {0};
@@ -692,29 +716,27 @@ static void process_signal(unsigned int sig, siginfo_t *si, void *ptr)
 		ipc_run_flag = 0;
 	}
 }
-
 static int register_signal(void)
 {
-	struct sigaction s;
+    struct sigaction s;
+    memset(&s, 0, sizeof(s));
 
-	s.sa_flags = SA_SIGINFO;
-	s.sa_sigaction = (void *)process_signal;
+    s.sa_flags = SA_SIGINFO;
+    s.sa_sigaction = process_signal;
 
-	/* register signals that we should handle */
-//	sigaction(SIGSEGV, &s, NULL);
-	sigaction(SIGINT, &s, NULL);
-	sigaction(SIGTERM, &s, NULL);
-	sigaction(SIGUSR1, &s, NULL);
-	sigaction(SIGUSR2, &s, NULL);
-	sigaction(SIGALRM, &s, NULL);
-	sigaction(SIGHUP, &s, NULL);
-//	sigaction(SIGPIPE, &s, NULL);
+    sigaction(SIGINT,  &s, NULL);
+    sigaction(SIGTERM, &s, NULL);
+    sigaction(SIGUSR1, &s, NULL);
+    sigaction(SIGUSR2, &s, NULL);
+    sigaction(SIGALRM, &s, NULL);
+    sigaction(SIGHUP,  &s, NULL);
 
-	signal(SIGPIPE, SIG_IGN);
-	signal(SIGCHLD, SIG_IGN);
+    signal(SIGPIPE, SIG_IGN);
+    signal(SIGCHLD, SIG_IGN);
 
-	return 0;
+    return 0;
 }
+
 
 int main(void)
 {
