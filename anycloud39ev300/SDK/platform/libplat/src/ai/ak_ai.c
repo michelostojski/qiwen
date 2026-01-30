@@ -9,7 +9,8 @@
 #include "ak_ring_buffer.h"
 #include "ak_ai.h"
 #include "ai_ipcsrv.h"
-
+#include "ak_gpio.h"
+#include "ak_cpu.h"
 #define PLAT_AI		                    "<plat_ai>"
 
 #define AK_AI_SAMPLE_RATE               (8000)
@@ -35,6 +36,13 @@
 #define ADC_CAP_DROP_TIME 				360
 /* we keep 5 seconds pcm frame */
 #define AI_MAX_FRAME_TIME		        (5 * 1000)
+
+
+static unsigned long long ak_timeval_to_ms(struct ak_timeval *tv)
+{
+    return ((unsigned long long)tv->sec * 1000ULL) +
+           ((unsigned long long)tv->usec / 1000ULL);
+}
 
 struct pcm_frame_node {
     struct frame frame;			/* audio pcm frame */
@@ -267,6 +275,41 @@ static inline unsigned long get_pcm_data_len(int user_fd)
  */
  static int pcm_set_source(pcm_user_t *user)
 {
+    int value;
+
+    if (!user)
+        return AK_FAILED;
+
+    switch (user->ak_ft.dev) {
+    case AKPCM_CPTRDEV_MIC:
+        value = SOURCE_ADC_MIC;
+        ak_print_notice_ex("set ai source to MIC\n");
+        break;
+
+    case AKPCM_CPTRDEV_LI:
+        value = SOURCE_ADC_LINEIN;
+        ak_print_notice_ex("set ai source to LineIn\n");
+        break;
+
+    default:
+        value = SOURCE_ADC_MIC;
+        break;
+    }
+
+    if (ioctl(user->cp_fd, IOC_SET_SOURCES, &value) < 0) {
+        ak_print_error("IOC_SET_SOURCES failed\n");
+        return AK_FAILED;
+    }
+
+    pcm_adc.dev_hw = user->ak_ft.dev;
+    user->mute_flag = AK_FALSE;
+
+    return AK_SUCCESS;
+}
+
+ #if 0
+ static int pcm_set_source(pcm_user_t *user)
+{
     /*
      * Do NOT touch ADC source before first IOC_PREPARE.
      * Just remember the desired source for later.
@@ -281,7 +324,6 @@ static inline unsigned long get_pcm_data_len(int user_fd)
 }
 
  
- #if 0
 static int pcm_set_source(pcm_user_t *user)
 {
 	int value = AKPCM_CPTRDEV_AUTO;
@@ -545,97 +587,7 @@ static int init_echo_lib_attr(pcm_user_t *user)
  * @user[IN]: pointer point to adc parameters.
  * return: 0 success, -1 failed
  */
- #if 0
-static int set_param_to_adc_driver(pcm_user_t *user)
-{
-	int ret;
-	int src = AI_SOURCE_MIC;
-	int gain = 4;   /* mic gain: tune later */
 
-	/* reset ADC buffer */
-	ioctl(user->cp_fd, IOC_RSTBUF, NULL);
-
-	/* select MIC as input source */
-	ret = ioctl(user->cp_fd, IOC_SET_SOURCES, &src);
-	if (ret < 0) {
-		ak_print_error("IOC_SET_SOURCES failed\n");
-		return AK_FAILED;
-	}
-
-	/* set input gain (MIC by default) */
-	ret = ioctl(user->cp_fd, IOC_SET_GAIN, &gain);
-	if (ret < 0) {
-		ak_print_error("IOC_SET_GAIN failed\n");
-		return AK_FAILED;
-	}
-
-	
-
-	/* start ADC */
-	ret = ioctl(user->cp_fd, IOC_RESUME, NULL);
-	if (ret < 0) {
-		ak_print_error("IOC_RESUME failed\n");
-		return AK_FAILED;
-	}
-
-	return AK_SUCCESS;
-}
-
-static int set_param_to_adc_driver(pcm_user_t *user)
-{
-	int ret;
-	int src = AI_SOURCE_MIC;
-	int gain = 4;   /* mic gain: tune later */
-
-	/* reset ADC buffer */
-	ioctl(user->cp_fd, IOC_RSTBUF, NULL);
-
-	/* select MIC as input source */
-	ret = ioctl(user->cp_fd, IOC_SET_SOURCES, &src);
-	if (ret < 0) {
-		ak_print_error("IOC_SET_SOURCES failed\n");
-		return AK_FAILED;
-	}
-
-	/* set input gain (MIC by default) */
-	ret = ioctl(user->cp_fd, IOC_SET_GAIN, &gain);
-	if (ret < 0) {
-		ak_print_error("IOC_SET_GAIN failed\n");
-		return AK_FAILED;
-	}
-
-	
-
-	/* start ADC */
-	ret = ioctl(user->cp_fd, IOC_RESUME, NULL);
-	if (ret < 0) {
-		ak_print_error("IOC_RESUME failed\n");
-		return AK_FAILED;
-	}
-
-	return AK_SUCCESS;
-}
-
-static int set_param_to_adc_driver(pcm_user_t *user)
-{
-    int src  = AI_SOURCE_MIC;
-    int gain = 4;
-
-    /* NO pause, NO reset, NO prepare */
-
-    if (ioctl(user->cp_fd, IOC_SET_SOURCES, &src) < 0) {
-        ak_print_error("IOC_SET_SOURCES failed\n");
-        return AK_FAILED;
-    }
-
-    if (ioctl(user->cp_fd, IOC_SET_GAIN, &gain) < 0) {
-        ak_print_error("IOC_SET_GAIN failed\n");
-        return AK_FAILED;
-    }
-
-    return AK_SUCCESS;
-}
-#endif
 static int set_param_to_adc_driver(pcm_user_t *user)
 {
     int src  = AI_SOURCE_MIC;
@@ -947,6 +899,45 @@ static int read_adc_driver(void *handle, unsigned char *to, unsigned int size)
     if (pcm_adc.fd == AK_INVALID_FD) {
         pcm_adc.fd = open(ADC_DEV_NAME, O_RDWR);
         if (pcm_adc.fd < 0) {
+            ak_thread_mutex_unlock(&pcm_adc.mutex);
+            return NULL;
+        }
+        fcntl(pcm_adc.fd, F_SETFD, FD_CLOEXEC);
+    }
+
+    user = ak_calloc(1, sizeof(pcm_user_t));
+    if (!user) {
+        ak_thread_mutex_unlock(&pcm_adc.mutex);
+        return NULL;
+    }
+
+    user->cp_fd  = pcm_adc.fd;
+    user->ctl_fd = pcm_adc.fd;   // ✅ THIS FIXES EVERYTHING
+
+    user->param.rate        = 8000;
+    user->param.channels    = 1;
+    user->param.sample_bits = 16;
+
+    load_adc_default_param(user);
+
+    pcm_adc.run_flag = AK_TRUE;
+    pcm_adc.users_count++;
+
+    ak_thread_mutex_unlock(&pcm_adc.mutex);
+    return user;
+}
+
+
+ #if 0
+ static void* pcm_adc_open(void)
+{
+    pcm_user_t *user = NULL;
+
+    ak_thread_mutex_lock(&pcm_adc.mutex);
+
+    if (pcm_adc.fd == AK_INVALID_FD) {
+        pcm_adc.fd = open(ADC_DEV_NAME, O_RDWR);
+        if (pcm_adc.fd < 0) {
             ak_print_error("open %s failed: %s\n",
                            ADC_DEV_NAME, strerror(errno));
             ak_thread_mutex_unlock(&pcm_adc.mutex);
@@ -977,70 +968,8 @@ static int read_adc_driver(void *handle, unsigned char *to, unsigned int size)
     ak_thread_mutex_unlock(&pcm_adc.mutex);
     return user;
 }
-
- #if 0
-static void* pcm_adc_open(void)
-{
-    pcm_user_t *user = NULL;
-
-    ak_thread_mutex_lock(&pcm_adc.mutex);
-
-    if (pcm_adc.fd == AK_INVALID_FD) {
-
-       pcm_adc.ctl_fd  = open("/dev/akpcm_adc",  O_RDWR);
-pcm_adc.data_fd = open("/dev/akpcm_adc0", O_RDONLY);
-
-if (pcm_adc.ctl_fd < 0 || pcm_adc.data_fd < 0) {
-    ak_print_error("open akpcm adc nodes failed: %s\n", strerror(errno));
-    goto adc_open_end;
-}
-user->ctl_fd = pcm_adc.ctl_fd;
-user->cp_fd  = pcm_adc.data_fd;
-
-        if (pcm_adc.fd < 0) {
-            ak_print_error("open %s failed: %s\n",
-                           ADC_DEV_NAME, strerror(errno));
-            goto fail;
-        }
-
-        fcntl(pcm_adc.fd, F_SETFD, FD_CLOEXEC);
-
-        /* ✅ REQUIRED: PREPARE FIRST */
-        if (ioctl(pcm_adc.fd, IOC_PREPARE, NULL) < 0) {
-            ak_print_error("IOC_PREPARE failed at open\n");
-            close(pcm_adc.fd);
-            pcm_adc.fd = AK_INVALID_FD;
-            goto fail;
-        }
-
-        pcm_adc.prepare_flag = AK_TRUE;
-    }
-
-    user = ak_calloc(1, sizeof(pcm_user_t));
-    if (!user) {
-        ak_print_error("calloc ADC user error\n");
-        goto fail;
-    }
-
-    /* sane defaults */
-    user->param.rate        = 8000;
-    user->param.channels    = 1;
-    user->param.sample_bits = 16;
-
-    user->cp_fd = pcm_adc.fd;
-    load_adc_default_param(user);
-
-    pcm_adc.run_flag = AK_TRUE;
-    pcm_adc.users_count++;
-
-    ak_thread_mutex_unlock(&pcm_adc.mutex);
-    return user;
-
-fail:
-    ak_thread_mutex_unlock(&pcm_adc.mutex);
-    return NULL;
-}
 #endif
+ 
 /**
  * pcm_set_param: save parameter
  * @handle[IN]: AD device handle
@@ -1180,6 +1109,7 @@ static int pcm_adc_close(pcm_user_t *user)
 	return AK_SUCCESS;
 }
 
+
 /**
  * pcm_adc_set_volume: driver set volume
  * @user[IN]: AD user handle
@@ -1318,6 +1248,7 @@ static int read_pcm_data(pcm_user_t *user)
 		}
 	} else {
 		/* put data to ring buffer */
+		ak_print_notice("READ_PCM ret=%d\n", read_size);
 		ak_rb_write(pcm_adc.rb_handle, pcm_adc.capture_buf, read_size);
 	}
 
@@ -1359,6 +1290,68 @@ static void drop_extra_frame(struct pcm_frame_node *cur_entry)
  * @user[IN]: AD user handle
  * return: NULL
  */
+ static void generate_pcm_frame_list(pcm_user_t *user)
+{
+ak_print_notice_ex(
+    "GEN: rb_remain=%d frame_size=%d\n",
+    ak_rb_get_data_len(pcm_adc.rb_handle),
+    pcm_adc.frame_size
+);
+
+    int ret_len = 0;
+    struct pcm_frame_node *entry = NULL;
+    int remain = ak_rb_get_data_len(pcm_adc.rb_handle);
+
+    while (remain >= pcm_adc.frame_size) {
+
+        entry = malloc_pcm_frame_node(pcm_adc.frame_size);
+        if (!entry)
+            break;
+
+        ret_len = ak_rb_read(pcm_adc.rb_handle,
+                             entry->frame.data,
+                             pcm_adc.frame_size);
+        if (ret_len < 0) {
+            ak_print_error_ex("read from ring buffer failed\n");
+            free_pcm_frame_node(entry);
+            break;
+        }
+
+        entry->frame.len = pcm_adc.frame_size;
+
+        /* ===================== FIX START ===================== */
+
+        /* first frame: initialize timestamp base */
+        if (pcm_adc.pre_frame_ts == 0) {
+          struct ak_timeval tv;
+ak_get_ostime(&tv);
+pcm_adc.pre_frame_ts = ak_timeval_to_ms(&tv);
+        } else {
+            pcm_adc.pre_frame_ts += pcm_adc.frame_interval;
+        }
+
+        entry->frame.ts     = pcm_adc.pre_frame_ts;
+        entry->frame.seq_no = ++pcm_adc.get_seq_no;
+
+        ak_print_notice_ex(
+            "AI FRAME: ts=%llu seq=%lu len=%d\n",
+            entry->frame.ts,
+            entry->frame.seq_no,
+            entry->frame.len
+        );
+
+        /* ===================== FIX END ===================== */
+
+        ak_thread_mutex_lock(&(pcm_adc.read_mutex));
+        drop_extra_frame(entry);
+        list_add_tail(&(entry->list), &(pcm_adc.frame_head));
+        ak_thread_mutex_unlock(&(pcm_adc.read_mutex));
+
+        remain -= pcm_adc.frame_size;
+    }
+}
+
+ #if 0
 static void generate_pcm_frame_list(pcm_user_t *user)
 {
 ak_print_notice_ex(
@@ -1402,12 +1395,75 @@ ak_print_notice_ex(
         }
 	}
 }
-
+#endif
 /**
  * capture_pcm_thread: capture audio pcm data from AD
  * @arg[IN]: AD user handle
  * return: NULL
  */
+static void* capture_pcm_thread(void *arg)
+{
+    pcm_user_t *user = (pcm_user_t *)arg;
+    ak_thread_set_name("ai_capture");
+
+    ak_print_notice("AI CAPTURE THREAD STARTED, cp_fd=%d\n", user->cp_fd);
+
+    static short raw[800];   // 1600 bytes @ 16-bit mono
+    int dma_primed = 0;      // 🔴 one-time DMA prime flag
+
+    while (pcm_adc.run_flag) {
+
+        ak_thread_sem_wait(&pcm_adc.capture_sem);
+        ak_print_notice("AI CAPTURE WAKEUP\n");
+
+       /* 🔑 PRIME + BIND DMA */
+         static int primed = 0;
+        if (!dma_primed) {
+            struct frame f;
+            memset(&f, 0, sizeof(f));
+
+            ak_ai_get_frame(user, &f,0);   
+        
+    ak_print_notice("AI DMA PRIMED + BOUND\n");
+    primed = 1;
+}
+
+        while (pcm_adc.run_flag && pcm_adc.capture_flag) {
+
+            int avail = get_pcm_data_len(user->cp_fd);
+            ak_print_notice("AI PCM avail=%d\n", avail);
+
+            if (avail <= 0) {
+                ak_sleep_ms(10);
+                continue;
+            }
+
+            if (avail < sizeof(raw)) {
+                ak_sleep_ms(5);
+                continue;
+            }
+
+            int r = read(user->cp_fd, raw, sizeof(raw));
+
+            if (r > 0) {
+                ak_print_notice(
+                    "RAW READ OK: bytes=%d sample0=%d sample1=%d\n",
+                    r, raw[0], raw[1]
+                );
+            } else {
+                ak_print_error("RAW READ failed errno=%d\n", errno);
+                ak_sleep_ms(20);
+            }
+        }
+    }
+
+    ak_print_notice("AI CAPTURE THREAD EXIT\n");
+    return NULL;
+}
+
+
+
+ #if 0
  static void* capture_pcm_thread(void *arg)
 {
     ak_print_normal_ex("thread id: %ld\n", ak_thread_get_tid());
@@ -1431,11 +1487,14 @@ ak_print_notice_ex(
         while (pcm_adc.run_flag && pcm_adc.capture_flag) {
 
             int avail = get_pcm_data_len(user->cp_fd);
+            
+            ak_print_notice("AI PCM avail=%d fd=%d\n", avail, user->cp_fd);
 
 #if AI_READ_PCM_DRV_DEBUG
             ak_get_ostime(&cur_time);
             if (ak_diff_ms_time(&cur_time, &cap_time) > 500) {
-                cap_time = cur_time;
+                cap_time = cur
+_time;
                 ak_print_notice_ex(
                     "AI avail=%d, period=%d, capture_len=%d\n",
                     avail,
@@ -1444,6 +1503,8 @@ ak_print_notice_ex(
                 );
             }
 #endif
+
+ak_print_notice("AI PCM avail=%d\n", avail);
 
             /* ✅ Only read when enough data exists */
             if (avail >= user->param.period_bytes) {
@@ -1464,7 +1525,6 @@ ak_print_notice_ex(
     return NULL;
 }
 
- #if 0
 static void* capture_pcm_thread(void *arg)
 {
 	ak_print_normal_ex("thread id: %ld\n", ak_thread_get_tid());
@@ -1629,9 +1689,16 @@ static void ad_copy_for_dual_channel(const unsigned char *src, int len,
 		dest[j * 4 + 3] = src[j * 2 + 1];
 	}
 }
-
+#if 0
 static int get_frame_non_block(void *handle, struct frame *frame)
 {
+/* HARD GUARD: audio must be mono for RTP */
+if (user->param.channels != AUDIO_CHANNEL_MONO) {
+    ak_print_error_ex("FATAL: audio must be mono for RTP\n");
+    user->param.channels = AUDIO_CHANNEL_MONO;
+}
+
+
     int ret = AK_FAILED;
     pcm_user_t *user = (pcm_user_t *)handle;
 
@@ -1701,6 +1768,65 @@ static int get_frame_timeout(void *handle, struct frame *frame, long wait_time)
 
     return ret;
 }
+#endif
+static int get_frame_non_block(void *handle, struct frame *frame)
+{
+    int ret = AK_FAILED;
+    pcm_user_t *user = (pcm_user_t *)handle;
+
+    /* 🔒 Safety: force mono */
+    if (user->param.channels != AUDIO_CHANNEL_MONO) {
+        ak_print_error_ex("audio must be mono for RTP, forcing mono\n");
+        user->param.channels = AUDIO_CHANNEL_MONO;
+        user->actual_ch = 1;
+    }
+
+    ak_thread_mutex_lock(&(pcm_adc.read_mutex));
+
+    if (pcm_adc.run_flag ) {
+        struct pcm_frame_node *entry = NULL;
+        struct pcm_frame_node *ptr = NULL;
+        int frame_len = 0;
+
+        list_for_each_entry_safe(entry, ptr, &(pcm_adc.frame_head), list) {
+            frame_len = entry->frame.len;   /* MONO ONLY */
+
+            frame->data = ak_calloc(1, frame_len);
+            if (!frame->data) {
+                ak_print_error_ex("calloc frame->data failed\n");
+                break;
+            }
+
+            memcpy(frame->data, entry->frame.data, frame_len);
+
+            frame->len    = frame_len;
+            frame->ts     = entry->frame.ts;
+            frame->seq_no = entry->frame.seq_no;
+
+            list_del_init(&(entry->list));
+            free_pcm_frame_node(entry);
+
+            ret = AK_SUCCESS;
+            break;
+        }
+    }
+
+    ak_thread_mutex_unlock(&(pcm_adc.read_mutex));
+    return ret;
+}
+static int get_frame_block(void *handle, struct frame *frame)
+{
+    /* Legacy ABI requires this symbol */
+    return get_frame_non_block(handle, frame);
+}
+static int get_frame_timeout(void *handle,
+                             struct frame *frame,
+                             unsigned int timeout_ms)
+{
+    /* Timeout ignored – driver is already paced */
+    (void)timeout_ms;
+    return get_frame_non_block(handle, frame);
+}
 
 /**
  * ak_ai_print_filter_info - print audio filter version & support functions
@@ -1731,53 +1857,7 @@ const char* ak_ai_get_version(void)
  * notes:
  */
  #if 0
-void* ak_ai_open(const struct pcm_param *param)
-{
-	if (param == NULL) {
-		ak_print_error_ex("param is NULL\n");
-		return NULL;
-	}
-	
-	if(!pcm_adc.run_flag) {
-		if (init_pcm_adc(param)) {
-			return NULL;
-		}
-	}
 
-	if (param->sample_rate < 8000 || param->sample_rate > 64000) {
-		/* sample rate not support  */
-		ak_print_error_ex("sample rate not suppprt %d \n", param->sample_rate);
-		return NULL;
-	}
-
-    ak_print_notice_ex("ai version %s \n", ai_version);
-    /* 🔴 CRITICAL GUARD */
-    if (pcm_adc.ai_handle) {
-        ak_print_notice_ex("ai already opened, reuse handle\n");
-        return pcm_adc.ai_handle;
-    }
-    void *handle = pcm_adc_open();
-	if(handle){
-		pcm_user_t *user = (pcm_user_t *)handle;
-	    user->param.channels = param->channel_num;
-	    user->param.rate = param->sample_rate;
-	    user->param.sample_bits = param->sample_bits;
-
-	    raw_param_t ad = {0};
-
-	    ad.sample_bits = param->sample_bits;
-	    ad.sample_rate = param->sample_rate;
-	    /* reopen check */
-	    pcm_set_param(handle, (void *)&ad);
-
-	    ai_sys_ipc_register();
-	    ai_sysipc_bind_handle(handle);
-	}
-    pcm_adc.ai_handle = handle;
-
-    return handle;
-}
-#endif
 void* ak_ai_open(const struct pcm_param *param)
 {
     if (param == NULL) {
@@ -1815,7 +1895,8 @@ void* ak_ai_open(const struct pcm_param *param)
     user->param.channels    = param->channel_num;
     user->param.rate        = param->sample_rate;
     user->param.sample_bits = param->sample_bits;
-
+    
+  
     raw_param_t ad = {0};
     ad.sample_rate = param->sample_rate;
     ad.sample_bits = param->sample_bits;
@@ -1827,12 +1908,57 @@ void* ak_ai_open(const struct pcm_param *param)
     ai_sysipc_bind_handle(handle);
 
     pcm_adc.ai_handle = handle;
-    /* 🔴 FORCE START AUDIO (DIAGNOSTIC) */
-//ak_print_notice_ex("FORCING audio capture start\n");
-//ak_ai_start_capture(handle);
-  //  return handle;
+  
 }
+#endif
+void* ak_ai_open(const struct pcm_param *param)
+{
+    if (!param) {
+        ak_print_error_ex("param is NULL\n");
+        return NULL;
+    }
 
+    if (!pcm_adc.run_flag) {
+        if (init_pcm_adc(param))
+            return NULL;
+    }
+
+    if (param->sample_rate < 8000 || param->sample_rate > 64000) {
+        ak_print_error_ex("sample rate not supported %d\n", param->sample_rate);
+        return NULL;
+    }
+
+    ak_print_notice_ex("ai version %s\n", ai_version);
+
+    /* reuse handle */
+    if (pcm_adc.ai_handle) {
+        ak_print_notice_ex("ai already opened, reuse handle\n");
+        return pcm_adc.ai_handle;
+    }
+
+    pcm_user_t *user = pcm_adc_open();
+    if (!user)
+        return NULL;
+
+    /* 🔒 FORCE MONO – RTP / G711 requires it */
+    user->param.channels    = AUDIO_CHANNEL_MONO;
+    user->actual_ch         = 1;
+    user->param.rate        = param->sample_rate;
+    user->param.sample_bits = param->sample_bits;
+
+    pcm_adc.running = user;
+
+    raw_param_t ad = {0};
+    ad.sample_rate = param->sample_rate;
+    ad.sample_bits = param->sample_bits;
+    pcm_set_param(user, &ad);
+
+    ai_sys_ipc_register();
+    ai_sysipc_bind_handle(user);
+
+    pcm_adc.ai_handle = user;
+    return user;
+}
 
 /**
  * ak_ai_get_params - start ADC capture
@@ -1884,7 +2010,6 @@ int ak_ai_get_handle(int dev_id, void **ai_handle)
  * return: 0 success, -1 failed
  * notes: call after set all kind of ADC attr
  */
- #if 0
 int ak_ai_start_capture(void *handle)
 {
     if (!handle)
@@ -1894,242 +2019,65 @@ int ak_ai_start_capture(void *handle)
 
     ak_thread_mutex_lock(&pcm_adc.mutex);
 
-    /* Already running */
-    if (pcm_adc.capture_flag) {
+    /* thread already running → just wake it */
+    if (pcm_adc.thread_flag) {
+        pcm_adc.capture_flag = AK_TRUE;
         ak_thread_sem_post(&pcm_adc.capture_sem);
         ak_thread_mutex_unlock(&pcm_adc.mutex);
         return AK_SUCCESS;
     }
 
-    /* 1) Configure ADC (safe to repeat) */
-    if (set_param_to_adc_driver(user) < 0) {
-        ak_thread_mutex_unlock(&pcm_adc.mutex);
-        return AK_FAILED;
-    }
+    /* FIRST TIME START */
+    pcm_adc.running      = user;
+    pcm_adc.run_flag     = AK_TRUE;
+    pcm_adc.capture_flag = AK_TRUE;
 
-    /* 2) PREPARE ONCE */
+    /* PREPARE ONCE */
     if (!pcm_adc.prepare_flag) {
-        ak_print_notice_ex("ADC prepare\n");
-
-        if (ioctl(user->cp_fd, IOC_PREPARE, NULL) < 0) {
-            ak_print_error_ex("IOC_PREPARE failed: %s\n", strerror(errno));
-            ak_thread_mutex_unlock(&pcm_adc.mutex);
-            return AK_FAILED;
-        }
-
+        ioctl(user->ctl_fd, IOC_RSTBUF, NULL);
+        ioctl(user->ctl_fd, IOC_PREPARE, NULL);
         pcm_adc.prepare_flag = AK_TRUE;
     }
 
-    /* 3) START DMA */
+    /* SET MIC SOURCE */
+    int src = SOURCE_ADC_MIC;
+    if (ioctl(user->cp_fd, IOC_SET_SOURCES, &src) < 0) {
+        ak_print_error("IOC_SET_SOURCES failed\n");
+    } else {
+        ak_print_notice("ADC source set to MIC\n");
+    }
+
+    /* 🔴 START STREAMING (CRITICAL POINT) */
     if (ioctl(user->cp_fd, IOC_RESUME, NULL) < 0) {
-        ak_print_error_ex("IOC_RESUME failed: %s\n", strerror(errno));
+        ak_print_error("IOC_RESUME failed on cp_fd\n");
         ak_thread_mutex_unlock(&pcm_adc.mutex);
         return AK_FAILED;
     }
 
-    pcm_adc.running = user;
+    ak_print_notice("ADC streaming started on cp_fd=%d\n", user->cp_fd);
 
-if (!pcm_adc.prepare_flag) {
-    ak_print_notice_ex("Preparing ADC (once)\n");
-
-    if (ioctl(user->cp_fd, IOC_PREPARE, NULL) < 0) {
-        ak_print_error_ex("IOC_PREPARE failed: %s\n", strerror(errno));
+    /* CREATE CAPTURE THREAD */
+    if (ak_thread_create(&pcm_adc.tid,
+                         capture_pcm_thread,
+                         handle,
+                         ANYKA_THREAD_MIN_STACK_SIZE,
+                         -1)) {
+        pcm_adc.run_flag = AK_FALSE;
+        pcm_adc.capture_flag = AK_FALSE;
         ak_thread_mutex_unlock(&pcm_adc.mutex);
         return AK_FAILED;
     }
 
-    pcm_adc.prepare_flag = AK_TRUE;
-}
-
-/* ALWAYS start DMA here */
-if (ioctl(user->cp_fd, IOC_RESUME, NULL) < 0) {
-    ak_print_error_ex("IOC_RESUME failed: %s\n", strerror(errno));
-    ak_thread_mutex_unlock(&pcm_adc.mutex);
-    return AK_FAILED;
-}
-
-
-
-    /* 4) Resample setup */
-    if (set_adc_resample(user)) {
-        ak_thread_mutex_unlock(&pcm_adc.mutex);
-        return AK_FAILED;
-    }
-
-    /* 5) Start capture thread */
-    pcm_adc.capture_flag = AK_TRUE;
-
-    if (!pcm_adc.thread_flag) {
-        int ret = ak_thread_create(
-            &pcm_adc.tid,
-            capture_pcm_thread,
-            handle,
-            ANYKA_THREAD_MIN_STACK_SIZE,
-            -1
-        );
-        if (ret) {
-            pcm_adc.capture_flag = AK_FALSE;
-            ak_thread_mutex_unlock(&pcm_adc.mutex);
-            return AK_FAILED;
-        }
-        pcm_adc.thread_flag = AK_TRUE;
-    }
+    pcm_adc.thread_flag = AK_TRUE;
 
     ak_rb_reset(pcm_adc.rb_handle);
+
+    /* 🔓 ONLY NOW wake the thread */
     ak_thread_sem_post(&pcm_adc.capture_sem);
 
     ak_thread_mutex_unlock(&pcm_adc.mutex);
     return AK_SUCCESS;
 }
-
- 
-int ak_ai_start_capture(void *handle)
-{
-	if (pcm_adc.running) {
-		/* ai capture had started */
-		return AK_SUCCESS;
-	}
-
-	ak_print_info_ex("enter...\n");
-	if(!handle) {
-		set_error_no(ERROR_TYPE_POINTER_NULL);
-		return AK_FAILED;
-	}
-
-	pcm_user_t *user = (pcm_user_t *)handle;
-	if ((AK_INVALID_FD == user->cp_fd) || (user->cp_fd != pcm_adc.fd)) {
-		ak_print_error_ex("audio uer fd error, cp_fd=%d, fd=%d\n",
-			user->cp_fd, pcm_adc.fd);
-		set_error_no(ERROR_TYPE_INVALID_USER);
-		return AK_FAILED;
-	}
-
-	int ret = AK_FAILED;
-	ak_thread_mutex_lock(&pcm_adc.mutex);
-	
-	/* Always reconfigure ADC before capture */
-if (set_param_to_adc_driver(user) < 0)
-    goto start_capture_end;
-
-pcm_adc.running = (void *)user;
-
-
-	if (set_adc_resample(user)) {
-		goto start_capture_end;
-	}
-
-	pcm_adc.capture_flag = AK_TRUE;
-	if (pcm_adc.thread_flag) {
-		ret = AK_SUCCESS;
-	} else {
-		ret = ak_thread_create(&(pcm_adc.tid), capture_pcm_thread,
-			handle, ANYKA_THREAD_MIN_STACK_SIZE, -1);
-		if (ret) {
-			pcm_adc.capture_flag = AK_FALSE;
-			ak_print_error("create capture_pcm_thread FAILED, ret=%d\n",
-			    ret);
-			goto start_capture_end;
-		} else {
-			pcm_adc.thread_flag = AK_TRUE;
-			ak_print_info_ex("create capture pcm thread OK\n");
-		}
-	}
-
-	ak_rb_reset(pcm_adc.rb_handle);
-	ak_thread_sem_post(&pcm_adc.capture_sem);
-
-start_capture_end:
-	if (ret) {
-		pcm_adc.running = NULL;
-	}
-	ak_thread_mutex_unlock(&pcm_adc.mutex);
-	ak_print_info_ex("leave..., capture_flag=%d\n", pcm_adc.capture_flag);
-
-	return ret;
-}
-#endif
-int ak_ai_start_capture(void *handle)
-{
-ak_thread_mutex_lock(&pcm_adc.mutex);
-
-/* 🔴 THIS IS THE FIX */
-if (pcm_adc.thread_flag) {
-    pcm_adc.capture_flag = AK_TRUE;
-    ak_thread_sem_post(&pcm_adc.capture_sem);
-    ak_thread_mutex_unlock(&pcm_adc.mutex);
-    return AK_SUCCESS;
-}
-
-
-    if (!handle)
-        return AK_FAILED;
-
-    pcm_user_t *user = (pcm_user_t *)handle;
-
-    ak_thread_mutex_lock(&pcm_adc.mutex);
-
-   if (!pcm_adc.prepare_flag) {
-    ioctl(user->ctl_fd, IOC_RSTBUF, NULL);
-    ioctl(user->ctl_fd, IOC_PREPARE, NULL);
-    ioctl(user->ctl_fd, IOC_RESUME, NULL);
-    pcm_adc.prepare_flag = AK_TRUE;
-}
-    pcm_adc.running = user;
-
-    /* set ADC source + gain ONLY */
-    if (set_param_to_adc_driver(user) < 0) {
-        ak_thread_mutex_unlock(&pcm_adc.mutex);
-        return AK_FAILED;
-    }
-if (pcm_adc.prepare_flag) {
-
-    /* now it's SAFE */
-    load_adc_default_param(user);
-
-    set_param_to_adc_driver(user);
-
-    if (ioctl(user->cp_fd, IOC_RESUME, NULL) < 0) {
-        ak_print_error("IOC_RESUME failed\n");
-        return AK_FAILED;
-    }
-}
-
-    /* ✅ ONLY RESUME — NO PREPARE */
-    if (ioctl(user->cp_fd, IOC_RESUME, NULL) < 0) {
-        ak_print_error_ex("IOC_RESUME failed: %s\n", strerror(errno));
-        ak_thread_mutex_unlock(&pcm_adc.mutex);
-        return AK_FAILED;
-    }
-
-    if (set_adc_resample(user)) {
-      ak_print_error_ex("set_adc_resample FAILED\n");
-        ak_thread_mutex_unlock(&pcm_adc.mutex);
-        return AK_FAILED;
-    }
-
-    pcm_adc.capture_flag = AK_TRUE;
-
-    if (!pcm_adc.thread_flag) {
-        if (ak_thread_create(&pcm_adc.tid,
-                             capture_pcm_thread,
-                             handle,
-                             ANYKA_THREAD_MIN_STACK_SIZE,
-                             -1)) {
-            pcm_adc.capture_flag = AK_FALSE;
-            ak_thread_mutex_unlock(&pcm_adc.mutex);
-            return AK_FAILED;
-        }
-        pcm_adc.thread_flag = AK_TRUE;
-    }
-
-    ak_rb_reset(pcm_adc.rb_handle);
-    ak_thread_sem_post(&pcm_adc.capture_sem);
-
-    ak_thread_mutex_unlock(&pcm_adc.mutex);
-    return AK_SUCCESS;
-}
-
-
 
 /**
  * ak_ai_stop_capture - stop ADC capture
