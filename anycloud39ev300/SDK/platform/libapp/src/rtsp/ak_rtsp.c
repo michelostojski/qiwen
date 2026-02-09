@@ -11,17 +11,20 @@
 #include "ak_ai.h"
 #include "ak_aenc.h"
 #include "ak_rtsp.h"
+#include "ak_dvr_record.h"
 #include "ak_net.h"
 
 #include <akae_stdlib.h>
 #include <akae_rtspserver.h>
 #include <akae_thread.h>
 
-
+/* ===== EXTERNAL AI HANDLE ===== */
+extern void *ai_handle;  // declared in ipc_main.c
 
 #define LEN_IFACE 32
 #define LEN_IP    32
 #define LEN_LINK  128
+
 AK_int ak_rtsp_stop(AK_int index)
 {
     (void)index;  /* index unused, silence warnings */
@@ -38,6 +41,13 @@ AK_int ak_rtsp_stop(AK_int index)
  * 内部单体使用的内存分配器，初始化代表模块已经初始化。
  */
 static AK_Object _Heap = AK_null;
+
+/* Forward declarations with correct AK_ThreadFunc signature */
+static AK_void _buffer_aenc(AK_Thread th, AK_int argc, AK_voidptr argv[]);
+static AK_void _buffer_venc(AK_Thread th, AK_int argc, AK_voidptr argv[]);
+
+
+
 
 /**
  * @ref _Heap 句柄对应的所分配内存。
@@ -59,99 +69,32 @@ static AK_Object _VStreamQ[RTSP_CHANNEL_NUM], _711aStreamQ;
 
 /// 传入配置参数。
 static struct rtsp_param _rtsp_ctrl_param;
+#if 0
+static void rtsp_venc_set_bps(
+    void *venc_handle,
+    struct rtsp_channel_cfg_t *rtsp_chn)
+{
+    int target_kbps = 0, max_kbps = 0;
 
+    if (rtsp_chn->target_ratio != 0) {
+        max_kbps = rtsp_chn->max_kbps;
+        target_kbps = rtsp_chn->target_ratio * max_kbps / 100;
+
+        ak_venc_set_kbps(venc_handle, target_kbps, max_kbps);
+
+        if (rtsp_chn->smart.smart_mode != 0) {
+            ak_venc_set_smart_config(venc_handle, &rtsp_chn->smart);
+        }
+    }
+}
+#endif
 
 static const char rtsp_version[] = "libapp_rtsp V2.0.00";
-
-static void rtsp_venc_set_bps(void *venc_handle, 
-		struct rtsp_channel_cfg_t *rtsp_chn)
-{
-	int target_kbps = 0, max_kbps = 0;
-
-	/* ratio is not zero, its VBR model */
-	if (rtsp_chn->target_ratio != 0) {
-		/* normal VBR model */
-		max_kbps = rtsp_chn->max_kbps;	
-		target_kbps = rtsp_chn->target_ratio * max_kbps / 100;
-
-		/* according to ratio, set target bps and max bps */
-		ak_venc_set_kbps(venc_handle, target_kbps, max_kbps);
-
-		/* smart model VBR */
-		if (rtsp_chn->smart.smart_mode != 0) {
-			ak_venc_set_smart_config(venc_handle, &rtsp_chn->smart);
-		}
-	}
-}
 
 /*
  * init video encode by index to indicate which encode group
  */
-static void *video_encode_init(enum rtsp_channel index)
-{
- // Hard guard to validate resolution parameters
-    if (_rtsp_ctrl_param.rtsp_chn[index].width == 0 ||
-        _rtsp_ctrl_param.rtsp_chn[index].height == 0) {
-        ak_print_error(
-            "RTSP: invalid resolution rtsp_ch=%d %dx%d\n",
-            index,
-            _rtsp_ctrl_param.rtsp_chn[index].width,
-            _rtsp_ctrl_param.rtsp_chn[index].height
-        );
-        return NULL;
-    }
-
-	struct encode_param param = {0};
-
-	param.width   = _rtsp_ctrl_param.rtsp_chn[index].width;;
-	param.height  = _rtsp_ctrl_param.rtsp_chn[index].height;;
-	param.minqp   = _rtsp_ctrl_param.rtsp_chn[index].min_qp;
-	param.maxqp   = _rtsp_ctrl_param.rtsp_chn[index].max_qp;
-	param.fps     = _rtsp_ctrl_param.rtsp_chn[index].fps;
-	param.goplen  = param.fps * _rtsp_ctrl_param.rtsp_chn[index].gop_len;
-	param.bps     = _rtsp_ctrl_param.rtsp_chn[index].max_kbps;
-	param.br_mode = _rtsp_ctrl_param.rtsp_chn[index].video_br_mode;
-	param.enc_out_type = _rtsp_ctrl_param.rtsp_chn[index].video_enc_type;
-
-	switch (index) {
-	case RTSP_CHANNEL_MAIN:	//main channel
-		param.use_chn = ENCODE_MAIN_CHN;
-		param.enc_grp = ENCODE_MAINCHN_NET;
-
-		switch (_rtsp_ctrl_param.rtsp_chn[index].video_enc_type) {
-        case H264_ENC_TYPE:
-            param.profile = PROFILE_MAIN;
-            break;
-        case HEVC_ENC_TYPE:
-            param.profile = PROFILE_HEVC_MAIN;
-            break;
-        default:
-            break;
-        }
-		break;
-	case RTSP_CHANNEL_SUB:	//sub channel
-		param.use_chn = ENCODE_SUB_CHN;
-		param.enc_grp = ENCODE_SUBCHN_NET;
-
-		switch (_rtsp_ctrl_param.rtsp_chn[index].video_enc_type) {
-        case H264_ENC_TYPE:
-            param.profile = PROFILE_MAIN;
-            break;
-        case HEVC_ENC_TYPE:
-            param.profile = PROFILE_HEVC_MAIN;
-            break;
-        default:
-            break;
-        }
-		break;
-	default:
-		return NULL;
-	}
-
-	return ak_venc_open(&param);
-}
-
-
+ 
 /**
  * ak_rtsp_get_version - get rtsp version
  * return: version string
@@ -167,119 +110,152 @@ static inline int rtsp_ch_to_vi_ch(int rtsp_ch)
     return rtsp_ch;
 }
 
-static AK_void _buffer_aenc (AK_Thread th, AK_int argc, AK_voidptr argv[]) {
 
-	void *ak_ai = NULL, *ak_aenc = NULL;
-	struct pcm_param ai_param;
-	struct audio_param aenc_param;
+/* VIDEO-ONLY RTSP - Pas d'audio
+ * 
+ * Remplacez la fonction _buffer_aenc dans ak_rtsp.c
+ */
 
-	ai_param.sample_bits = 16;
-	ai_param.channel_num = AUDIO_CHANNEL_MONO;
-	ai_param.sample_rate = AK_AUDIO_SAMPLE_RATE_8000;
+static AK_void _buffer_aenc(AK_Thread th, AK_int argc, AK_voidptr argv[])
+{
+    /* Désactiver complètement l'audio RTSP */
+    ak_print_notice("RTSP: Audio disabled (video only)\n");
+    
+    /* Le thread se termine immédiatement */
+    return;
+}
 
-	ak_ai = ak_ai_open (&ai_param);
-    AK_ASSERT (NULL != ak_ai);
+#if 0
+static AK_void _buffer_venc(AK_Thread th, AK_int argc, AK_voidptr argv[])
+{
+    int ch = (int)(intptr_t)argv[0];
+    void *vstream = _rtsp_ctrl_param.rtsp_chn[ch].vstream;  // ← Utiliser la copie globale!
 
-    ak_ai_set_nr_agc (ak_ai, AUDIO_FUNC_ENABLE);
-    ak_ai_set_aec (ak_ai, AUDIO_FUNC_ENABLE);
-	ak_ai_set_aslc_volume(ak_ai, 4);
-    ak_ai_set_volume(ak_ai, 2);
+    ak_print_notice_ex("RTSP ch=%d vstream=%p\n", ch, vstream);
 
-    ak_ai_set_source(ak_ai, AI_SOURCE_MIC);
-	ak_ai_clear_frame_buffer(ak_ai);
-	ak_ai_set_frame_interval (ak_ai, 40);
-
-	aenc_param.type = AK_AUDIO_TYPE_PCM_ALAW;
-	aenc_param.sample_bits = 16;
-	aenc_param.channel_num = AUDIO_CHANNEL_MONO;
-	aenc_param.sample_rate = AK_AUDIO_SAMPLE_RATE_8000;
-	ak_aenc = ak_aenc_open(&aenc_param);
-	AK_ASSERT (NULL != ak_aenc);
-
-    ak_print_normal("ak_aenc_open OK\n");
-	if (aenc_param.type == AK_AUDIO_TYPE_AAC) {
-	    struct aenc_attr attr;
-	    attr.aac_head = AENC_AAC_SAVE_FRAME_HEAD;
-	    ak_aenc_set_attr (ak_aenc, &attr);
+    if (!vstream) {
+        ak_print_error("vstream NULL for ch=%d\n", ch);
+        return;
     }
 
-	ak_ai_start_capture(ak_ai);
+    // Attendre que le VI soit prêt
+    int wait_count = 0;
+    while (!akae_thread_terminated(th) && wait_count < 50) {
+        struct video_stream vs = {0};
+        
+        if (AK_SUCCESS == ak_venc_get_stream(vstream, &vs)) {
+            ak_print_notice("RTSP ch=%d: VI ready!\n", ch);
+            ak_venc_release_stream(vstream, &vs);
+            break;
+        }
+        
+        wait_count++;
+        if (wait_count % 10 == 0) {
+            ak_print_notice("RTSP ch=%d: waiting... (%d/50)\n", ch, wait_count);
+        }
+        akae_thread_suspend(th, 0, 200, 0);
+    }
 
-	while (!akae_thread_terminated (th)) {
+    if (wait_count >= 50) {
+        ak_print_error("RTSP ch=%d: VI timeout\n", ch);
+        return;
+    }
 
-		struct frame ai_frame = {0};
-		struct audio_stream stream = {0};
-		unsigned char audio[1024];
+    ak_print_notice("RTSP ch=%d: streaming!\n", ch);
 
-		while (ak_ai_get_frame (ak_ai, &ai_frame, 0) == AK_SUCCESS) {
+    // Boucle principale
+    while (!akae_thread_terminated(th)) {
+        struct video_stream vs = {0};
 
-			memset (&stream, 0, sizeof (stream));
-			stream.data = audio;
-			stream.len = sizeof (audio);
+        while (AK_SUCCESS == ak_venc_get_stream(vstream, &vs)) {
+            akae_rtp_queue_add_payload(_VStreamQ[ch], vs.ts, vs.data, vs.len);
+            ak_venc_release_stream(vstream, &vs);
+        }
 
-			if (ak_aenc_send_frame (ak_aenc, &ai_frame, &stream) > 0) {
-				akae_rtp_queue_add_payload (_711aStreamQ, (AK_uint32)ai_frame.ts, stream.data, stream.len);
-			}
-
-			ak_ai_release_frame(ak_ai, &ai_frame);
-		}
-
-		akae_thread_suspend (th, 0, 20, 0);
-	}
-
-	ak_aenc_close (ak_aenc);
-	ak_aenc = NULL;
-
-	ak_ai_stop_capture (ak_ai);
-	ak_ai_close (ak_ai);
-
+        akae_thread_suspend(th, 0, 30, 0);
+    }
 }
+static AK_void _buffer_venc(AK_Thread th, AK_int argc, AK_voidptr argv[])
+{
+    int ch = (int)(intptr_t)argv[0];
+    void *vstream = _rtsp_ctrl_param.rtsp_chn[ch].vstream;
 
+    ak_print_notice_ex("RTSP ch=%d vstream=%p\n", ch, vstream);
 
+    if (!vstream) {
+        ak_print_error("vstream NULL for ch=%d\n", ch);
+        return;
+    }
 
-static AK_void _buffer_venc (AK_Thread th, AK_int argc, AK_voidptr argv[]) {
+    // ← ATTENDRE 3 SECONDES avant le premier appel
+    ak_print_notice("RTSP ch=%d: waiting 3s for VI...\n", ch);
+    akae_thread_suspend(th, 0, 3000, 0);
+    ak_print_notice("RTSP ch=%d: starting now\n", ch);
 
-	void *ak_venc = NULL, *ak_vstream = NULL;
-	AK_int ch = (AK_int)(argv[0]);
+    // Boucle principale
+    while (!akae_thread_terminated(th)) {
+        struct video_stream vs = {0};
+        int ret;
 
-	/* venc open for sub net */
-	ak_venc = video_encode_init (ch);
-	//AK_ASSERT (NULL != ak_venc);
-if (!ak_vstream) {
-    ak_print_error("venc stream create failed, exit thread\n");
-    goto venc_exit;
+        ret = ak_venc_get_stream(vstream, &vs);
+        if (ret == AK_SUCCESS) {
+            akae_rtp_queue_add_payload(_VStreamQ[ch], vs.ts, vs.data, vs.len);
+            ak_venc_release_stream(vstream, &vs);
+        }
+
+        akae_thread_suspend(th, 0, 30, 0);
+    }
+    
+    ak_print_notice("RTSP ch=%d: stopped\n", ch);
 }
-	rtsp_venc_set_bps (ak_venc, &_rtsp_ctrl_param.rtsp_chn[ch]);
+#endif
+static AK_void _buffer_venc(AK_Thread th, AK_int argc, AK_voidptr argv[])
+{
+    int ch = (int)(intptr_t)argv[0];
+    void *vstream = NULL;
 
-	/* venc request */
-	ak_vstream = ak_venc_request_stream(_rtsp_ctrl_param.rtsp_chn[ch].vi_handle,
-			ak_venc);
-	AK_ASSERT (NULL != ak_vstream);
+    ak_print_notice_ex("RTSP THREAD start ch=%d\n", ch);
 
+    /* 🔑 WAIT until DVR creates vstream */
+    while (!akae_thread_terminated(th)) {
+        vstream = ak_dvr_record_get_vstream_by_chn(ch);
+        if (vstream) {
+            ak_print_notice_ex("RTSP ch=%d got vstream=%p\n", ch, vstream);
+            break;
+        }
+        akae_thread_suspend(th, 0, 200, 0);
+    }
 
-	while (!akae_thread_terminated (th)) {
+    if (!vstream) {
+        ak_print_error("RTSP ch=%d exit: vstream NULL\n", ch);
+        return;
+    }
 
-		struct video_stream vs = {0};
+    /* Optional: wait for first frame */
+    struct video_stream vs = {0};
+    while (!akae_thread_terminated(th)) {
+        if (AK_SUCCESS == ak_venc_get_stream(vstream, &vs)) {
+            ak_venc_release_stream(vstream, &vs);
+            break;
+        }
+        akae_thread_suspend(th, 0, 200, 0);
+    }
 
-		/// 读取数据至空为止。
-		while (AK_SUCCESS == ak_venc_get_stream (ak_vstream, &vs)) {
-			/// 缓冲媒体数据到队列。
-			akae_rtp_queue_add_payload (_VStreamQ[ch], (AK_uint32)vs.ts, vs.data, vs.len);
-			ak_venc_release_stream (ak_vstream, &vs);
-		}
+    ak_print_notice_ex("RTSP ch=%d streaming\n", ch);
 
-		akae_thread_suspend (th, 0, 30, 0);
-
-	}
-
-	ak_venc_cancel_stream (ak_vstream);
-	ak_venc_close (ak_venc);
-
+    while (!akae_thread_terminated(th)) {
+        while (AK_SUCCESS == ak_venc_get_stream(vstream, &vs)) {
+            akae_rtp_queue_add_payload(
+                _VStreamQ[ch],
+                vs.ts,
+                vs.data,
+                vs.len
+            );
+            ak_venc_release_stream(vstream, &vs);
+        }
+        akae_thread_suspend(th, 0, 30, 0);
+    }
 }
-
-
-
-
 
 /**
  * ak_rtsp_init - init rtsp param
@@ -302,6 +278,14 @@ int ak_rtsp_init(struct rtsp_param *param)
 		ak_print_error_ex("invalid argument\n");
 		return -1;
 	}
+	
+
+ak_print_error("RTSP bind: ch0=%p ch1=%p\n",
+    param->rtsp_chn[0].vstream,
+    param->rtsp_chn[1].vstream);
+	
+	
+	
 /* ---- EARLY VALIDATION: MUST be before Heap/Server creation ---- */
 for (i = 0; i < RTSP_CHANNEL_NUM; i++) {
     if (param->rtsp_chn[i].suffix_name[0] == '\0') {
@@ -343,17 +327,27 @@ akae_rtsp_server_verbose(_Server, AK_true);
 akae_rtsp_server_verbose_http(_Server, AK_true);
 
 /// 创建音频缓冲
+/*
 _711aStreamQ = akae_rtp_queue_create(_Heap, AK_RTP_PT_PCMA);
 if (_711aStreamQ == AK_null) {
     ak_print_error_ex("RTSP: audio queue create failed\n");
     goto fail;
 }
+*/
+_AStreamTH = akae_thread_create(
+    "aenc",
+    0,                      // stack size
+    0,                      // priority
+    _buffer_aenc,           // ✅ Direct call, correct signature
+    0,
+    NULL
+);
 
-_AStreamTH = akae_thread_create_default(_buffer_aenc);
 if (_AStreamTH <= 0) {
     ak_print_error_ex("RTSP: audio thread create failed\n");
     goto fail;
 }
+
 
 for (i = 0; i < RTSP_CHANNEL_NUM; ++i) {
 
@@ -368,7 +362,6 @@ for (i = 0; i < RTSP_CHANNEL_NUM; ++i) {
         goto fail;
     }
 
-    /// 注册监听地址
     registry = akae_rtsp_server_register_url(
         _Server,
         param->rtsp_chn[i].suffix_name,
@@ -391,27 +384,56 @@ for (i = 0; i < RTSP_CHANNEL_NUM; ++i) {
         90000,
         _VStreamQ[i]
     );
-
+/*
     akae_rtsp_server_describe_g711a(_Server, registry, _711aStreamQ);
+*/
+ argv[0] = (AK_voidptr)(intptr_t)i;
+argc = 1;
+ //argc = 0;
+ //argv[argc++] = (AK_voidptr)(intptr_t)i;
+//argv[argc++] = param->rtsp_chn[i].vstream;
 
+_VStreamTH[i] = akae_thread_create(
+    i == 0 ? "venc_main" : "venc_sub",
+    0,              // stack size
+    0,              // priority
+    _buffer_venc,   // function
+    argc,           // argc
+    argv            // argv
+);
 
-		/// 创建后台线程缓冲编码数据。
-		argc = 0;
-		argv[argc++] = (AK_voidptr)(i);
-		_VStreamTH[i] = akae_thread_create_default2 (_buffer_venc, argc, argv);
-		AK_ASSERT (_VStreamTH[i] > 0);
+if (_VStreamTH[i] <= 0) {
+    ak_print_error_ex("RTSP: failed to create venc thread ch=%d\n", i);
+    goto fail;
+}
+}
+/* start server AFTER loop */
+if (AK_OK != akae_rtsp_server_start(_Server, port)) {
+    port = 8554;
+    if (AK_OK != akae_rtsp_server_start(_Server, port)) {
+        ak_print_error_ex("RTSP server start failed\n");
+        goto fail;
+    }
+}
 
-	}
+return 0;
 
-	if (AK_OK != akae_rtsp_server_start (_Server, port)) {
-		port = 8554;
-		akae_rtsp_server_start (_Server, port);
-	}
+fail:
+if (_Server) {
+    akae_rtsp_server_release(_Server);
+    _Server = AK_null;
+}
+if (_Heap) {
+    akae_malloc_release(_Heap, AK_null, AK_null);
+    _Heap = AK_null;
+}
+return -1;
+
 
 
 	ak_net_get_cur_iface(ac_iface);
 	ak_net_get_ip(ac_iface, ac_ip) ;
-	COLOR_PRINT( COLOR_MODE_BOLD, COLOR_BACK_BLACK, COLOR_FRONT_GREEN, ac_rtsp, LEN_LINK, "***********************************************\n" )
+COLOR_PRINT( COLOR_MODE_BOLD, COLOR_BACK_BLACK, COLOR_FRONT_GREEN, ac_rtsp, LEN_LINK, "***********************************************\n" )
 	COLOR_PRINT( COLOR_MODE_BOLD, COLOR_BACK_BLACK, COLOR_FRONT_GREEN, ac_rtsp, LEN_LINK, "*                  RTSP LINK                  *\n" )
 	COLOR_PRINT( COLOR_MODE_BOLD, COLOR_BACK_BLACK, COLOR_FRONT_GREEN, ac_rtsp, LEN_LINK, "***********************************************\n" )
 	COLOR_PRINT( COLOR_MODE_BOLD, COLOR_BACK_BLACK, COLOR_FRONT_GREEN, ac_rtsp, LEN_LINK, "* MAIN CHANNEL : rtsp://%s:%d/%s\n", ac_ip, port, param->rtsp_chn[0].suffix_name)
@@ -419,8 +441,8 @@ for (i = 0; i < RTSP_CHANNEL_NUM; ++i) {
 	COLOR_PRINT( COLOR_MODE_BOLD, COLOR_BACK_BLACK, COLOR_FRONT_GREEN, ac_rtsp, LEN_LINK, "***********************************************\n" )
 
 	return 0;
-	
 }
+
 
 /**
  * @deprecated >= 1.9.00
